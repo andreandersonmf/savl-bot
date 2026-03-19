@@ -190,6 +190,8 @@ class DenyReasonModal(discord.ui.Modal, title="Deny Transfer"):
             await interaction.response.send_message("Não foi possível localizar requester/player no servidor.", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         execute("""
             UPDATE transfers
             SET status = 'denied', reason = ?, handled_by = ?
@@ -219,7 +221,7 @@ class DenyReasonModal(discord.ui.Modal, title="Deny Transfer"):
         except discord.Forbidden:
             pass
 
-        await interaction.response.send_message("Transferência negada com sucesso.", ephemeral=True)
+        await interaction.followup.send("Transferência negada com sucesso.", ephemeral=True)
 
 
 class TransferRequestView(discord.ui.View):
@@ -238,38 +240,38 @@ class TransferRequestView(discord.ui.View):
         if not can_approve_transfer(interaction.user):
             await interaction.response.send_message("Apenas Staff/Admin pode aceitar essa transação.", ephemeral=True)
             return
-        
+
         await interaction.response.defer(ephemeral=True)
 
         transfer = fetchone("SELECT * FROM transfers WHERE id = ?", (self.transfer_id,))
         if not transfer:
-            await interaction.response.send_message("Transfer não encontrada.", ephemeral=True)
+            await interaction.followup.send("Transfer não encontrada.", ephemeral=True)
             return
 
         if transfer["status"] != "pending":
-            await interaction.response.send_message("Essa transferência já foi concluída.", ephemeral=True)
+            await interaction.followup.send("Essa transferência já foi concluída.", ephemeral=True)
             return
 
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Guild não encontrada.", ephemeral=True)
+            await interaction.followup.send("Guild não encontrada.", ephemeral=True)
             return
 
         team = fetchone("SELECT * FROM teams WHERE id = ?", (transfer["team_id"],))
         if team is None:
-            await interaction.response.send_message("Time não encontrado.", ephemeral=True)
+            await interaction.followup.send("Time não encontrado.", ephemeral=True)
             return
 
         requester = guild.get_member(transfer["requester_discord_id"])
         player = guild.get_member(transfer["player_discord_id"])
 
         if requester is None or player is None:
-            await interaction.response.send_message("Não foi possível localizar requester/player no servidor.", ephemeral=True)
+            await interaction.followup.send("Não foi possível localizar requester/player no servidor.", ephemeral=True)
             return
 
         existing_team = get_player_current_team(player.id)
         if existing_team:
-            await interaction.response.send_message("Esse jogador já está registrado em um time.", ephemeral=True)
+            await interaction.followup.send("Esse jogador já está registrado em um time.", ephemeral=True)
             return
 
         execute("""
@@ -326,13 +328,9 @@ class TransferRequestView(discord.ui.View):
         if not can_approve_transfer(interaction.user):
             await interaction.response.send_message("Apenas Staff/Admin pode negar essa transação.", ephemeral=True)
             return
-        
-        await interaction.response.defer(ephemeral=True)
 
         modal = DenyReasonModal(self.bot, self.transfer_id, interaction.message)
         await interaction.response.send_modal(modal)
-
-        await interaction.followup.send("Transferência negada com sucesso.", ephemeral=True)
 
 def build_team_deleted_embed(requester: discord.Member, team_name: str, captain: discord.Member | None):
     embed = discord.Embed(
@@ -576,6 +574,8 @@ class TeamCog(commands.Cog):
             await interaction.response.send_message("Esse jogador já possui uma transferência pendente.", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         profile_data = await get_profile_data_from_member(player)
 
         transfer_id = execute("""
@@ -603,14 +603,15 @@ class TeamCog(commands.Cog):
         )
 
         view = TransferRequestView(self.bot, transfer_id, profile_data["profile_url"])
-        await interaction.response.defer(ephemeral=True)
-        await interaction.channel.send(embed=embed, view=view)
 
-        msg = await interaction.original_response()
+        sent_message = await interaction.channel.send(embed=embed, view=view)
+
         execute(
             "UPDATE transfers SET message_id = ? WHERE id = ?",
-            (msg.id, transfer_id)
+            (sent_message.id, transfer_id)
         )
+
+        await interaction.followup.send("Transfer request sent successfully.", ephemeral=True)
 
     @team.command(name="remove", description="Remove um jogador do time")
     async def team_remove(self, interaction: discord.Interaction, player: discord.Member):
@@ -630,8 +631,10 @@ class TeamCog(commands.Cog):
             await interaction.response.send_message("Você não está registrado como captain/vice captain de nenhum time.", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         if player.id == team["captain_discord_id"]:
-            await interaction.response.send_message("Você não pode remover o capitão do time por esse comando.", ephemeral=True)
+            await interaction.followup.send("Você não pode remover o capitão do time por esse comando.", ephemeral=True)
             return
 
         roster_row = fetchone("""
@@ -640,7 +643,7 @@ class TeamCog(commands.Cog):
         """, (team["id"], player.id))
 
         if not roster_row:
-            await interaction.response.send_message("Esse jogador não está no seu time.", ephemeral=True)
+            await interaction.followup.send("Esse jogador não está no seu time.", ephemeral=True)
             return
 
         execute(
@@ -670,8 +673,9 @@ class TeamCog(commands.Cog):
                 await player.remove_roles(*roles_to_remove, reason=f"Released by {interaction.user}")
 
         embed = build_release_embed(interaction.user, player, team["team_name"])
-        await interaction.response.defer(ephemeral=True)
         await interaction.channel.send(embed=embed)
+        await interaction.followup.send("Player removed successfully.", ephemeral=True)
+
 
     @team.command(name="leave", description="Sai do seu próprio time")
     async def team_leave(self, interaction: discord.Interaction):
@@ -685,7 +689,6 @@ class TeamCog(commands.Cog):
             )
             return
 
-        # Captain não pode usar
         captain_team = fetchone(
             "SELECT * FROM teams WHERE captain_discord_id = ?",
             (interaction.user.id,)
@@ -697,7 +700,8 @@ class TeamCog(commands.Cog):
             )
             return
 
-        # Verifica se o usuário está em algum roster
+        await interaction.response.defer(ephemeral=True)
+
         roster_row = fetchone("""
             SELECT r.*, t.team_name, t.team_role_id
             FROM roster r
@@ -706,13 +710,12 @@ class TeamCog(commands.Cog):
         """, (interaction.user.id,))
 
         if not roster_row:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Você não está registrado em nenhum time.",
                 ephemeral=True
             )
             return
 
-        # Remove do banco
         execute(
             "DELETE FROM roster WHERE team_id = ? AND discord_id = ?",
             (roster_row["team_id"], interaction.user.id)
@@ -748,8 +751,8 @@ class TeamCog(commands.Cog):
             team_name=roster_row["team_name"]
         )
 
-        await interaction.response.defer(ephemeral=True)
         await interaction.channel.send(embed=embed)
+        await interaction.followup.send("You left your team successfully.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
