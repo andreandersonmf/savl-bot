@@ -238,6 +238,8 @@ class TransferRequestView(discord.ui.View):
         if not can_approve_transfer(interaction.user):
             await interaction.response.send_message("Apenas Staff/Admin pode aceitar essa transação.", ephemeral=True)
             return
+        
+        await interaction.response.defer(ephemeral=True)
 
         transfer = fetchone("SELECT * FROM transfers WHERE id = ?", (self.transfer_id,))
         if not transfer:
@@ -314,7 +316,7 @@ class TransferRequestView(discord.ui.View):
             view=profile_only_view(profile_data["profile_url"])
         )
 
-        await interaction.response.send_message("Transferência aceita com sucesso.", ephemeral=True)
+        await interaction.followup.send("Transferência aceita com sucesso.", ephemeral=True)
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
     async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -324,10 +326,26 @@ class TransferRequestView(discord.ui.View):
         if not can_approve_transfer(interaction.user):
             await interaction.response.send_message("Apenas Staff/Admin pode negar essa transação.", ephemeral=True)
             return
+        
+        await interaction.response.defer(ephemeral=True)
 
         modal = DenyReasonModal(self.bot, self.transfer_id, interaction.message)
         await interaction.response.send_modal(modal)
 
+        await interaction.followup.send("Transferência negada com sucesso.", ephemeral=True)
+
+def build_team_deleted_embed(requester: discord.Member, team_name: str, captain: discord.Member | None):
+    embed = discord.Embed(
+        title="Team Deleted",
+        description=(
+            f"*submitted by {requester.mention}*\n"
+            f"**{team_name}** has been deleted from the system.\n\n"
+            f"Captain removed: {captain.mention if captain else 'Not found'}"
+        ),
+        color=discord.Color.red()
+    )
+    embed.set_footer(text="SAVL Team System")
+    return embed
 
 class TeamCog(commands.Cog):
     team = app_commands.Group(
@@ -339,8 +357,7 @@ class TeamCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @team.command(name="create", description="Registra um time no banco")
-    
+    @team.command(name="create", description="Registra um time no banco")    
     async def team_create(self, interaction: discord.Interaction, captain: discord.Member, role_team: discord.Role):
         if not isinstance(interaction.user, discord.Member):
             return
@@ -375,6 +392,98 @@ class TeamCog(commands.Cog):
             f"Time **{role_team.name}** criado com sucesso.\nCapitão: {captain.mention}\nCargo do time: {role_team.mention}",
             ephemeral=False
         )
+
+    @team.command(name="delete", description="Remove um time e seu capitão do banco")
+    async def team_delete(self, interaction: discord.Interaction, team: discord.Role):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not is_admin(interaction.user):
+            await interaction.response.send_message(
+                "Apenas administração pode usar esse comando.",
+                ephemeral=True
+            )
+            return
+
+        team_row = get_team_by_role(team.id)
+        if not team_row:
+            await interaction.response.send_message(
+                "Esse time não está registrado no banco.",
+                ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Guild não encontrada.", ephemeral=True)
+            return
+
+        captain = guild.get_member(team_row["captain_discord_id"])
+
+        # Remove todos os jogadores do roster desse time
+        roster_rows = fetchall(
+            "SELECT * FROM roster WHERE team_id = ?",
+            (team_row["id"],)
+        )
+
+        vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)
+        player_role = guild.get_role(config.PLAYER_ROLE_ID) if config.PLAYER_ROLE_ID else None
+        captain_role = guild.get_role(config.CAPTAIN_ROLE_ID)
+        team_role = guild.get_role(team_row["team_role_id"])
+
+        for row in roster_rows:
+            member = guild.get_member(row["discord_id"])
+            if member is None:
+                continue
+
+            roles_to_remove = []
+            if team_role:
+                roles_to_remove.append(team_role)
+
+            if row["role_type"] == "vice_captain":
+                if vice_role:
+                    roles_to_remove.append(vice_role)
+            else:
+                if player_role:
+                    roles_to_remove.append(player_role)
+
+            if roles_to_remove:
+                try:
+                    await member.remove_roles(
+                        *roles_to_remove,
+                        reason=f"Team {team_row['team_name']} deleted by {interaction.user}"
+                    )
+                except discord.Forbidden:
+                    pass
+
+        # Remove cargo do capitão
+        if captain is not None:
+            captain_roles_to_remove = []
+            if team_role:
+                captain_roles_to_remove.append(team_role)
+            if captain_role:
+                captain_roles_to_remove.append(captain_role)
+
+            if captain_roles_to_remove:
+                try:
+                    await captain.remove_roles(
+                        *captain_roles_to_remove,
+                        reason=f"Team {team_row['team_name']} deleted by {interaction.user}"
+                    )
+                except discord.Forbidden:
+                    pass
+
+        # Limpa banco
+        execute("DELETE FROM roster WHERE team_id = ?", (team_row["id"],))
+        execute("DELETE FROM transfers WHERE team_id = ?", (team_row["id"],))
+        execute("DELETE FROM teams WHERE id = ?", (team_row["id"],))
+
+        embed = build_team_deleted_embed(
+            requester=interaction.user,
+            team_name=team_row["team_name"],
+            captain=captain
+        )
+        await interaction.response.send_message(embed=embed)        
 
     @team.command(name="info", description="Mostra as informações completas de um time")
     async def team_info(self, interaction: discord.Interaction, team: discord.Role):
