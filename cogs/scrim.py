@@ -6,6 +6,11 @@ import config
 
 SCRIM_CHANNEL_ID = 1484037331534086206
 
+SCRIM_TYPE_CHOICES = [
+    app_commands.Choice(name="Now", value="Now"),
+    app_commands.Choice(name="Schedule", value="Schedule"),
+]
+
 
 class ScrimView(discord.ui.View):
     def __init__(self, user: discord.abc.User):
@@ -19,52 +24,45 @@ class ScrimView(discord.ui.View):
         )
 
 
-async def scrim_callback(interaction: discord.Interaction, scrim_type: app_commands.Choice[str]):
-    if interaction.channel_id != SCRIM_CHANNEL_ID:
-        await interaction.response.send_message(
-            "You can only use this command in the scrim channel.",
-            ephemeral=True
-        )
-        return
-
-    embed = discord.Embed(
-        title="Scrim request",
-        color=discord.Color.blurple()
-    )
-    embed.description = (
-        f"from {interaction.user.mention}\n"
-        f"Type: **{scrim_type.value}**"
-    )
-    embed.set_footer(text="SAVL Services")
-
-    await interaction.response.send_message(
-        embed=embed,
-        view=ScrimView(interaction.user)
-    )
-
-
-scrim_command = app_commands.Command(
-    name="scrim",
-    description="Create a scrim request",
-    callback=scrim_callback
-)
-
-scrim_command.describe(scrim_type="Now or Schedule")
-scrim_command.choices(scrim_type=[
-    app_commands.Choice(name="Now", value="Now"),
-    app_commands.Choice(name="Schedule", value="Schedule"),
-])
-
-
 class ScrimCog(commands.Cog):
+    scrim = app_commands.Group(
+        name="scrim",
+        description="Scrim commands",
+        guild_ids=[config.GUILD_ID]
+    )
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    @scrim.command(name="request", description="Create a scrim request")
+    @app_commands.choices(scrim_type=SCRIM_TYPE_CHOICES)
+    async def scrim_request(
+        self,
+        interaction: discord.Interaction,
+        scrim_type: app_commands.Choice[str]
+    ):
+        if interaction.channel_id != SCRIM_CHANNEL_ID:
+            await interaction.response.send_message(
+                "You can only use this command in the scrim channel.",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="Scrim request",
+            color=discord.Color.blurple()
+        )
+        embed.description = (
+            f"from {interaction.user.mention}\n"
+            f"Type: **{scrim_type.value}**"
+        )
+        embed.set_footer(text="SAVL Services")
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=ScrimView(interaction.user)
+        )
 
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(ScrimCog(bot))
-    bot.tree.add_command(
-        scrim_command,
-        guild=discord.Object(id=config.GUILD_ID),
-        override=True
-    )
