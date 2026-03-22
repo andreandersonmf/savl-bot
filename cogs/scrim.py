@@ -1,22 +1,22 @@
 import discord
-from discord import app_commands, Object
+from discord import app_commands
 from discord.ext import commands
-
-import config
 
 SCRIM_CHANNEL_ID = 1484037331534086206
 
 
 class ScrimView(discord.ui.View):
-    def __init__(self, user: discord.User):
+    def __init__(self, user: discord.abc.User):
         super().__init__(timeout=None)
         self.user = user
 
-    @discord.ui.button(label="Message", style=discord.ButtonStyle.secondary, emoji="✉️")
-    async def message_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            f"Message {self.user.mention} in DM.",
-            ephemeral=True
+        dm_url = f"https://discord.com/users/{user.id}"
+        self.add_item(
+            discord.ui.Button(
+                label="Message",
+                style=discord.ButtonStyle.link,
+                url=dm_url
+            )
         )
 
 
@@ -25,7 +25,6 @@ class Scrim(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="scrim", description="Create a scrim request")
-    @app_commands.guilds(Object(id=config.GUILD_ID))
     @app_commands.describe(scrim_type="Now or Schedule")
     @app_commands.choices(scrim_type=[
         app_commands.Choice(name="Now", value="Now"),
@@ -43,7 +42,7 @@ class Scrim(commands.Cog):
 
         embed = discord.Embed(
             title="Scrim request",
-            color=discord.Color.dark_blue()
+            color=discord.Color.blurple()
         )
         embed.description = (
             f"from {user.mention}\n"
@@ -55,6 +54,9 @@ class Scrim(commands.Cog):
 
         await interaction.response.send_message(embed=embed, view=view)
 
+    async def cog_load(self):
+        print("[OK] Scrim cog loaded")
 
-async def setup(bot):
+
+async def setup(bot: commands.Bot):
     await bot.add_cog(Scrim(bot))
