@@ -24,45 +24,39 @@ class ScrimView(discord.ui.View):
         )
 
 
-class ScrimCog(commands.Cog):
-    scrim = app_commands.Group(
-        name="scrim",
-        description="Scrim commands",
-        guild_ids=[config.GUILD_ID]
-    )
-
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @scrim.command(name="request", description="Create a scrim request")
-    @app_commands.choices(scrim_type=SCRIM_TYPE_CHOICES)
-    async def scrim_request(
-        self,
-        interaction: discord.Interaction,
-        scrim_type: app_commands.Choice[str]
-    ):
-        if interaction.channel_id != SCRIM_CHANNEL_ID:
-            await interaction.response.send_message(
-                "You can only use this command in the scrim channel.",
-                ephemeral=True
-            )
-            return
-
-        embed = discord.Embed(
-            title="Scrim request",
-            color=discord.Color.blurple()
-        )
-        embed.description = (
-            f"from {interaction.user.mention}\n"
-            f"Type: **{scrim_type.value}**"
-        )
-        embed.set_footer(text="SAVL Services")
-
+@app_commands.command(name="scrim", description="Create a scrim request")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.choices(scrim_type=SCRIM_TYPE_CHOICES)
+async def scrim_command(
+    interaction: discord.Interaction,
+    scrim_type: app_commands.Choice[str]
+):
+    if interaction.channel_id != SCRIM_CHANNEL_ID:
         await interaction.response.send_message(
-            embed=embed,
-            view=ScrimView(interaction.user)
+            "You can only use this command in the scrim channel.",
+            ephemeral=True
         )
+        return
+
+    embed = discord.Embed(
+        title="Scrim request",
+        color=discord.Color.blurple()
+    )
+    embed.description = (
+        f"from {interaction.user.mention}\n"
+        f"Request: **{scrim_type.value}**"
+    )
+    embed.set_footer(text="SAVL Services")
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=ScrimView(interaction.user)
+    )
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(ScrimCog(bot))
+    bot.tree.add_command(scrim_command)
+
+
+async def teardown(bot: commands.Bot):
+    bot.tree.remove_command("scrim", guild=discord.Object(id=config.GUILD_ID))
