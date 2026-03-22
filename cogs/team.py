@@ -146,6 +146,28 @@ def build_denied_transfer_embed(requester: discord.Member, player: discord.Membe
     return embed
 
 
+def build_cleared_transfer_embed(
+    requester: discord.Member | None,
+    player: discord.Member,
+    team_name: str,
+    cleared_by: discord.Member,
+    avatar_url: str | None
+):
+    embed = discord.Embed(
+        title="Transfer Cleared",
+        description=(
+            f"*manual action by {cleared_by.mention}*\n"
+            f"The pending transaction for {player.mention} to **{team_name}** was cleared manually."
+            + (f"\n\nOriginally requested by {requester.mention}" if requester else "")
+        ),
+        color=discord.Color.orange()
+    )
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+    embed.set_footer(text="SAVL Services")
+    return embed
+
+
 class DenyReasonModal(discord.ui.Modal, title="Deny Transfer"):
     reason = discord.ui.TextInput(
         label="Reason",
@@ -753,6 +775,84 @@ class TeamCog(commands.Cog):
 
         await interaction.channel.send(embed=embed)
         await interaction.followup.send("You left your team successfully.", ephemeral=True)
+
+
+    @team.command(name="clear", description="Limpa uma transferência pendente de um jogador")
+    async def team_clear(self, interaction: discord.Interaction, player: discord.Member):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not can_approve_transfer(interaction.user):
+            await interaction.response.send_message(
+                "Apenas Staff/Admin pode usar esse comando.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        transfer = fetchone("""
+            SELECT * FROM transfers
+            WHERE player_discord_id = ? AND status = 'pending'
+            ORDER BY id DESC
+            LIMIT 1
+        """, (player.id,))
+
+        if not transfer:
+            await interaction.followup.send(
+                "Esse jogador não possui nenhuma transferência pendente.",
+                ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("Guild não encontrada.", ephemeral=True)
+            return
+
+        team = fetchone("SELECT * FROM teams WHERE id = ?", (transfer["team_id"],))
+        requester = guild.get_member(transfer["requester_discord_id"]) if transfer["requester_discord_id"] else None
+
+        profile_data = await get_profile_data_from_member(player)
+
+        old_message = None
+        if transfer["channel_id"] and transfer["message_id"]:
+            channel = guild.get_channel(transfer["channel_id"])
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    old_message = await channel.fetch_message(transfer["message_id"])
+                except discord.NotFound:
+                    old_message = None
+                except discord.Forbidden:
+                    old_message = None
+                except discord.HTTPException:
+                    old_message = None
+
+        execute(
+            "DELETE FROM transfers WHERE id = ?",
+            (transfer["id"],)
+        )
+
+        if old_message and team is not None:
+            cleared_embed = build_cleared_transfer_embed(
+                requester=requester,
+                player=player,
+                team_name=team["team_name"],
+                cleared_by=interaction.user,
+                avatar_url=profile_data["avatar_url"]
+            )
+            try:
+                await old_message.edit(
+                    embed=cleared_embed,
+                    view=profile_only_view(profile_data["profile_url"])
+                )
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            f"Pending transfer de {player.mention} foi limpa com sucesso.",
+            ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):
