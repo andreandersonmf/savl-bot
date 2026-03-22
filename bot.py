@@ -10,7 +10,6 @@ EXTENSIONS = [
     "cogs.team",
     "cogs.match",
     "cogs.schedule",
-    "cogs.scrim",
 ]
 
 class SAVLBot(commands.Bot):
@@ -32,13 +31,11 @@ class SAVLBot(commands.Bot):
             await self.load_extension(ext)
 
         guild_obj = Object(id=config.GUILD_ID)
-
-        self.tree.clear_commands(guild=guild_obj)
         synced = await self.tree.sync(guild=guild_obj)
 
         print(f"Synced {len(synced)} command(s) to guild {config.GUILD_ID}")
         for cmd in synced:
-            print(f"/{cmd.name}")
+            print(f" - /{cmd.name}")
 
     async def on_ready(self):
         print(f"Logado como {self.user} (ID: {self.user.id})")
