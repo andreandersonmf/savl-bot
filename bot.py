@@ -1,5 +1,4 @@
 import discord
-
 from discord.ext import commands
 from discord import Object
 
@@ -36,7 +35,6 @@ class SAVLBot(commands.Bot):
 
     async def on_ready(self):
         print(f"Logado como {self.user} (ID: {self.user.id})")
-
 
 bot = SAVLBot()
 bot.run(config.DISCORD_TOKEN)
