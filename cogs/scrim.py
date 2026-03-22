@@ -15,12 +15,13 @@ SCRIM_TYPE_CHOICES = [
 class ScrimView(discord.ui.View):
     def __init__(self, user: discord.abc.User):
         super().__init__(timeout=None)
-        self.add_item(
-            discord.ui.Button(
-                label="Message",
-                style=discord.ButtonStyle.link,
-                url=f"https://discord.com/users/{user.id}"
-            )
+        self.user = user
+
+    @discord.ui.button(label="Message", style=discord.ButtonStyle.secondary, emoji="✉️")
+    async def message_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            f"Send a DM to {self.user.mention}",
+            ephemeral=True
         )
 
 
