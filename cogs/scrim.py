@@ -1,6 +1,8 @@
 import discord
-from discord import app_commands
+from discord import app_commands, Object
 from discord.ext import commands
+
+import config
 
 SCRIM_CHANNEL_ID = 1484037331534086206
 
@@ -8,14 +10,12 @@ SCRIM_CHANNEL_ID = 1484037331534086206
 class ScrimView(discord.ui.View):
     def __init__(self, user: discord.abc.User):
         super().__init__(timeout=None)
-        self.user = user
 
-        dm_url = f"https://discord.com/users/{user.id}"
         self.add_item(
             discord.ui.Button(
                 label="Message",
                 style=discord.ButtonStyle.link,
-                url=dm_url
+                url=f"https://discord.com/users/{user.id}"
             )
         )
 
@@ -38,25 +38,24 @@ class Scrim(commands.Cog):
             )
             return
 
-        user = interaction.user
-
         embed = discord.Embed(
             title="Scrim request",
             color=discord.Color.blurple()
         )
         embed.description = (
-            f"from {user.mention}\n"
+            f"from {interaction.user.mention}\n"
             f"Type: **{scrim_type.value}**"
         )
         embed.set_footer(text="SAVL Services")
 
-        view = ScrimView(user)
-
-        await interaction.response.send_message(embed=embed, view=view)
-
-    async def cog_load(self):
-        print("[OK] Scrim cog loaded")
+        await interaction.response.send_message(
+            embed=embed,
+            view=ScrimView(interaction.user)
+        )
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(Scrim(bot))
+    await bot.add_cog(
+        Scrim(bot),
+        guild=Object(id=config.GUILD_ID)
+    )
