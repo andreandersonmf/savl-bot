@@ -10,6 +10,7 @@ EXTENSIONS = [
     "cogs.team",
     "cogs.match",
     "cogs.schedule",
+    "cogs.scrim",
 ]
 
 class SAVLBot(commands.Bot):
