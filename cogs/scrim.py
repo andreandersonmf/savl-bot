@@ -48,7 +48,8 @@ async def scrim_command(
     )
     embed.set_footer(text="SAVL Services")
 
-    await interaction.response.send_message(
+    await interaction.response.defer()
+    await interaction.followup.send(
         embed=embed,
         view=ScrimView(interaction.user)
     )
