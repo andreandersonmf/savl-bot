@@ -1,5 +1,4 @@
 import discord
-
 from discord.ext import commands
 from discord import Object
 
@@ -30,13 +29,6 @@ class SAVLBot(commands.Bot):
 
         for ext in EXTENSIONS:
             await self.load_extension(ext)
-
-        guild_obj = Object(id=config.GUILD_ID)
-        synced = await self.tree.sync(guild=guild_obj)
-
-        print(f"Synced {len(synced)} command(s) to guild {config.GUILD_ID}")
-        for cmd in synced:
-            print(f" - /{cmd.name}")
 
     async def on_ready(self):
         print(f"Logado como {self.user} (ID: {self.user.id})")
