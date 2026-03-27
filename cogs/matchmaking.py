@@ -455,6 +455,29 @@ def build_result_embed(guild: discord.Guild | None, match_row):
     return embed
 
 
+def build_cancelled_embed(guild: discord.Guild | None, match_row, cancelled_by_id: int | None = None):
+    setters, spikers = build_queue_lines(guild, match_row["match_number"])
+
+    description = (
+        f"**Setters ({len(setters)}/{MAX_SETTERS})**\n"
+        f"{chr(10).join(setters) if setters else '—'}\n\n"
+        f"**Spikers ({len(spikers)}/{MAX_SPIKERS})**\n"
+        f"{chr(10).join(spikers) if spikers else '—'}\n\n"
+        f"**Status:** Cancelled"
+    )
+
+    if cancelled_by_id:
+        description += f"\n**Cancelled by:** {mention_or_name(guild, cancelled_by_id)}"
+
+    embed = discord.Embed(
+        title=f"SAVL Match Making Queue #{match_row['match_number']} • Cancelled",
+        description=description,
+        color=discord.Color.red()
+    )
+    embed.set_footer(text="SAVL Match Making")
+    return embed
+
+
 # =========================
 # ELO / STATS UPDATE
 # =========================
@@ -1276,6 +1299,59 @@ class MatchmakingCog(commands.Cog):
             SET queue_message_id = ?
             WHERE match_number = ?
         """, (sent_message.id, number))
+
+    @mm.command(name="cancel", description="Cancels a Match Making queue")
+    async def mm_cancel(self, interaction: discord.Interaction, number: int):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message(
+                "Apenas Match Organizer pode cancelar a fila.",
+                ephemeral=True
+            )
+            return
+
+        match_row = get_match_by_number(number)
+        if not match_row:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+
+        if match_row["status"] not in ("queue_open", "captains_pending", "draft", "ready_to_start"):
+            await interaction.response.send_message(
+                "Only queues that have not started yet can be cancelled.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        execute("""
+            UPDATE mm_matches
+            SET status = 'cancelled',
+                finished_at = ?
+            WHERE match_number = ?
+        """, (now_str(), number))
+
+        updated = get_match_by_number(number)
+        guild = interaction.guild
+
+        if guild is not None and updated["queue_channel_id"] and updated["queue_message_id"]:
+            queue_channel = guild.get_channel(updated["queue_channel_id"])
+            if isinstance(queue_channel, discord.TextChannel):
+                try:
+                    queue_message = await queue_channel.fetch_message(updated["queue_message_id"])
+                    await queue_message.edit(
+                        embed=build_cancelled_embed(guild, updated, interaction.user.id),
+                        view=None
+                    )
+                except discord.HTTPException:
+                    pass
+
+        await interaction.followup.send(
+            f"Match Making queue #{number} cancelled successfully.",
+            ephemeral=True
+        )
 
     @mm.command(name="finish", description="Finishes an in-progress Match Making match")
     @app_commands.choices(winner_team=TEAM_CHOICES, loser_team=TEAM_CHOICES)
