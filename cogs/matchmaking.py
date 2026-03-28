@@ -1267,8 +1267,22 @@ class MatchmakingCog(commands.Cog):
 
         existing = get_match_by_number(number)
         if existing:
-            await interaction.response.send_message("This match number already exists.", ephemeral=True)
-            return
+            if existing["status"] == "cancelled":
+                execute("""
+                    DELETE FROM mm_match_players
+                    WHERE match_number = ?
+                """, (number,))
+
+                execute("""
+                    DELETE FROM mm_matches
+                    WHERE match_number = ?
+                """, (number,))
+            else:
+                await interaction.response.send_message(
+                    f"Match #{number} already exists with status `{existing['status']}`.",
+                    ephemeral=True
+                )
+                return
 
         execute("""
             INSERT INTO mm_matches (
