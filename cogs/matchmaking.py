@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 import random
+import asyncio
+import sqlite3
 
 import discord
 from discord import app_commands
@@ -570,6 +572,7 @@ class JoinQueueView(discord.ui.View):
 
     async def refresh_message(self, interaction: discord.Interaction):
         self.refresh_labels()
+
         match_row = get_match_by_number(self.match_number)
         if not match_row:
             return
@@ -581,23 +584,31 @@ class JoinQueueView(discord.ui.View):
         """, (self.match_number,))
         total = total_row["total"] if total_row else 0
 
-        if total == 12 and match_row["status"] == "queue_open":
+        # Se lotou, troca UMA vez só para captains_pending
+        if total >= 12 and match_row["status"] == "queue_open":
             execute("""
                 UPDATE mm_matches
                 SET status = 'captains_pending'
-                WHERE match_number = ?
+                WHERE match_number = ? AND status = 'queue_open'
             """, (self.match_number,))
-            updated = get_match_by_number(self.match_number)
+            match_row = get_match_by_number(self.match_number)
+
+        # Releitura final do estado antes de editar
+        if not match_row:
+            return
+
+        if match_row["status"] == "captains_pending":
             await interaction.message.edit(
-                embed=build_captains_embed(interaction.guild, updated),
+                embed=build_captains_embed(interaction.guild, match_row),
                 view=CaptainSetupView(self.cog, self.match_number)
             )
             return
 
-        await interaction.message.edit(
-            embed=build_queue_embed(interaction.guild, match_row),
-            view=self
-        )
+        if match_row["status"] == "queue_open":
+            await interaction.message.edit(
+                embed=build_queue_embed(interaction.guild, match_row),
+                view=self
+            )
 
     @discord.ui.button(
         label="Join Setter (0/4)",
@@ -610,35 +621,50 @@ class JoinQueueView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        match_row = get_match_by_number(self.match_number)
-        if not match_row or match_row["status"] != "queue_open":
-            await interaction.response.send_message("This queue is no longer open.", ephemeral=True)
-            return
+        lock = self.cog.get_match_lock(self.match_number)
 
-        if is_user_busy(interaction.user.id):
-            await interaction.response.send_message("Você já está em outra queue/match ativa.", ephemeral=True)
-            return
+        async with lock:
+            match_row = get_match_by_number(self.match_number)
+            if not match_row or match_row["status"] != "queue_open":
+                await interaction.response.send_message("This queue is no longer open.", ephemeral=True)
+                return
 
-        count_row = fetchone("""
-            SELECT COUNT(*) AS total
-            FROM mm_match_players
-            WHERE match_number = ? AND role_pref = 'setter'
-        """, (self.match_number,))
-        setter_count = count_row["total"] if count_row else 0
+            existing_row = fetchone("""
+                SELECT * FROM mm_match_players
+                WHERE match_number = ? AND user_id = ?
+            """, (self.match_number, interaction.user.id))
+            if existing_row:
+                await interaction.response.send_message("Você já está nessa fila.", ephemeral=True)
+                return
 
-        if setter_count >= MAX_SETTERS:
-            await interaction.response.send_message("A fila de setters já está cheia.", ephemeral=True)
-            return
+            if is_user_busy(interaction.user.id):
+                await interaction.response.send_message("Você já está em outra queue/match ativa.", ephemeral=True)
+                return
 
-        execute("""
-            INSERT INTO mm_match_players (
-                match_number, user_id, role_pref, team_side, captain, pick_order, joined_at
-            )
-            VALUES (?, ?, 'setter', NULL, 0, NULL, ?)
-        """, (self.match_number, interaction.user.id, now_str()))
+            count_row = fetchone("""
+                SELECT COUNT(*) AS total
+                FROM mm_match_players
+                WHERE match_number = ? AND role_pref = 'setter'
+            """, (self.match_number,))
+            setter_count = count_row["total"] if count_row else 0
 
-        await interaction.response.defer()
-        await self.refresh_message(interaction)
+            if setter_count >= MAX_SETTERS:
+                await interaction.response.send_message("A fila de setters já está cheia.", ephemeral=True)
+                return
+
+            try:
+                execute("""
+                    INSERT INTO mm_match_players (
+                        match_number, user_id, role_pref, team_side, captain, pick_order, joined_at
+                    )
+                    VALUES (?, ?, 'setter', NULL, 0, NULL, ?)
+                """, (self.match_number, interaction.user.id, now_str()))
+            except sqlite3.IntegrityError:
+                await interaction.response.send_message("Você já entrou nessa fila.", ephemeral=True)
+                return
+
+            await interaction.response.defer()
+            await self.refresh_message(interaction)
 
     @discord.ui.button(
         label="Join Spiker (0/8)",
@@ -651,35 +677,50 @@ class JoinQueueView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        match_row = get_match_by_number(self.match_number)
-        if not match_row or match_row["status"] != "queue_open":
-            await interaction.response.send_message("This queue is no longer open.", ephemeral=True)
-            return
+        lock = self.cog.get_match_lock(self.match_number)
 
-        if is_user_busy(interaction.user.id):
-            await interaction.response.send_message("Você já está em outra queue/match ativa.", ephemeral=True)
-            return
+        async with lock:
+            match_row = get_match_by_number(self.match_number)
+            if not match_row or match_row["status"] != "queue_open":
+                await interaction.response.send_message("This queue is no longer open.", ephemeral=True)
+                return
 
-        count_row = fetchone("""
-            SELECT COUNT(*) AS total
-            FROM mm_match_players
-            WHERE match_number = ? AND role_pref = 'spiker'
-        """, (self.match_number,))
-        spiker_count = count_row["total"] if count_row else 0
+            existing_row = fetchone("""
+                SELECT * FROM mm_match_players
+                WHERE match_number = ? AND user_id = ?
+            """, (self.match_number, interaction.user.id))
+            if existing_row:
+                await interaction.response.send_message("Você já está nessa fila.", ephemeral=True)
+                return
 
-        if spiker_count >= MAX_SPIKERS:
-            await interaction.response.send_message("A fila de spikers já está cheia.", ephemeral=True)
-            return
+            if is_user_busy(interaction.user.id):
+                await interaction.response.send_message("Você já está em outra queue/match ativa.", ephemeral=True)
+                return
 
-        execute("""
-            INSERT INTO mm_match_players (
-                match_number, user_id, role_pref, team_side, captain, pick_order, joined_at
-            )
-            VALUES (?, ?, 'spiker', NULL, 0, NULL, ?)
-        """, (self.match_number, interaction.user.id, now_str()))
+            count_row = fetchone("""
+                SELECT COUNT(*) AS total
+                FROM mm_match_players
+                WHERE match_number = ? AND role_pref = 'spiker'
+            """, (self.match_number,))
+            spiker_count = count_row["total"] if count_row else 0
 
-        await interaction.response.defer()
-        await self.refresh_message(interaction)
+            if spiker_count >= MAX_SPIKERS:
+                await interaction.response.send_message("A fila de spikers já está cheia.", ephemeral=True)
+                return
+
+            try:
+                execute("""
+                    INSERT INTO mm_match_players (
+                        match_number, user_id, role_pref, team_side, captain, pick_order, joined_at
+                    )
+                    VALUES (?, ?, 'spiker', NULL, 0, NULL, ?)
+                """, (self.match_number, interaction.user.id, now_str()))
+            except sqlite3.IntegrityError:
+                await interaction.response.send_message("Você já entrou nessa fila.", ephemeral=True)
+                return
+
+            await interaction.response.defer()
+            await self.refresh_message(interaction)
 
     @discord.ui.button(
         label="Leave Queue",
@@ -689,28 +730,30 @@ class JoinQueueView(discord.ui.View):
     async def leave_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
         button.custom_id = f"mm_leave_queue_{self.match_number}"
 
-        match_row = get_match_by_number(self.match_number)
-        if not match_row or match_row["status"] != "queue_open":
-            await interaction.response.send_message("This queue is no longer open.", ephemeral=True)
-            return
+        lock = self.cog.get_match_lock(self.match_number)
 
-        row = fetchone("""
-            SELECT * FROM mm_match_players
-            WHERE match_number = ? AND user_id = ?
-        """, (self.match_number, interaction.user.id))
+        async with lock:
+            match_row = get_match_by_number(self.match_number)
+            if not match_row or match_row["status"] != "queue_open":
+                await interaction.response.send_message("This queue is no longer open.", ephemeral=True)
+                return
 
-        if not row:
-            await interaction.response.send_message("Você não está nessa fila.", ephemeral=True)
-            return
+            row = fetchone("""
+                SELECT * FROM mm_match_players
+                WHERE match_number = ? AND user_id = ?
+            """, (self.match_number, interaction.user.id))
 
-        execute("""
-            DELETE FROM mm_match_players
-            WHERE match_number = ? AND user_id = ?
-        """, (self.match_number, interaction.user.id))
+            if not row:
+                await interaction.response.send_message("Você não está nessa fila.", ephemeral=True)
+                return
 
-        await interaction.response.defer()
-        await self.refresh_message(interaction)
+            execute("""
+                DELETE FROM mm_match_players
+                WHERE match_number = ? AND user_id = ?
+            """, (self.match_number, interaction.user.id))
 
+            await interaction.response.defer()
+            await self.refresh_message(interaction)
 
 class CaptainPickSelect(discord.ui.Select):
     def __init__(self, cog: "MatchmakingCog", match_number: int, slot: int):
@@ -817,6 +860,85 @@ class CaptainPickSelect(discord.ui.Select):
                     embed=build_draft_embed(interaction.guild, updated),
                     view=DraftView(self.cog, self.match_number)
                 )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode definir capitães.", ephemeral=True)
+            return
+
+        lock = self.cog.get_match_lock(self.match_number)
+
+        async with lock:
+            match_row = get_match_by_number(self.match_number)
+            if not match_row or match_row["status"] != "captains_pending":
+                await interaction.response.send_message("This captain setup is no longer active.", ephemeral=True)
+                return
+
+            selected_user_id = int(self.values[0])
+
+            column = "captain1_id" if self.slot == 1 else "captain2_id"
+            execute(f"""
+                UPDATE mm_matches
+                SET {column} = ?
+                WHERE match_number = ?
+            """, (selected_user_id, self.match_number))
+
+            match_row = get_match_by_number(self.match_number)
+
+            try:
+                await interaction.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+            if match_row and match_row["captain1_id"] and match_row["captain2_id"]:
+                first_picker = random.choice([match_row["captain1_id"], match_row["captain2_id"]])
+
+                execute("""
+                    UPDATE mm_matches
+                    SET first_picker_id = ?, status = 'draft'
+                    WHERE match_number = ?
+                """, (first_picker, self.match_number))
+
+                execute("""
+                    UPDATE mm_match_players
+                    SET team_side = 'A', captain = 1, pick_order = 0
+                    WHERE match_number = ? AND user_id = ?
+                """, (self.match_number, match_row["captain1_id"]))
+
+                execute("""
+                    UPDATE mm_match_players
+                    SET team_side = 'B', captain = 1, pick_order = 0
+                    WHERE match_number = ? AND user_id = ?
+                """, (self.match_number, match_row["captain2_id"]))
+
+                updated = get_match_by_number(self.match_number)
+                queue_message = None
+
+                if interaction.guild and updated and updated["queue_channel_id"] and updated["queue_message_id"]:
+                    channel = interaction.guild.get_channel(updated["queue_channel_id"])
+                    if isinstance(channel, discord.TextChannel):
+                        try:
+                            queue_message = await channel.fetch_message(updated["queue_message_id"])
+                        except discord.HTTPException:
+                            queue_message = None
+
+                if queue_message and updated:
+                    await queue_message.edit(
+                        embed=build_draft_embed(interaction.guild, updated),
+                        view=DraftView(self.cog, self.match_number)
+                    )
+
+            else:
+                updated = get_match_by_number(self.match_number)
+                if updated:
+                    await interaction.response.edit_message(
+                        embed=build_captains_embed(interaction.guild, updated),
+                        view=CaptainSetupView(self.cog, self.match_number)
+                    )
+                    return
 
         await interaction.response.send_message(f"Captain {self.slot} set successfully.", ephemeral=True)
 
@@ -1121,7 +1243,13 @@ class MatchmakingCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.match_locks: dict[int, asyncio.Lock] = {}
         init_matchmaking_tables()
+
+    def get_match_lock(self, match_number: int) -> asyncio.Lock:
+        if match_number not in self.match_locks:
+            self.match_locks[match_number] = asyncio.Lock()
+        return self.match_locks[match_number]
 
     @season.command(name="start", description="Starts a new Match Making season")
     async def season_start(self, interaction: discord.Interaction, number: int):
