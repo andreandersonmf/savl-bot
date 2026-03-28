@@ -15,6 +15,12 @@ ROLE_CHOICES = [
 ]
 
 
+STAFF_ROLE_CHOICES = [
+    app_commands.Choice(name="Player", value="player"),
+    app_commands.Choice(name="Vice Captain", value="vice_captain"),
+]
+
+
 def is_admin(member: discord.Member) -> bool:
     return member.guild_permissions.administrator
 
@@ -61,6 +67,100 @@ def get_management_team(member: discord.Member):
 
 def get_team_by_role(role_id: int):
     return fetchone("SELECT * FROM teams WHERE team_role_id = ?", (role_id,))
+
+
+def get_team_by_name(team_name: str):
+    return fetchone("SELECT * FROM teams WHERE team_name = ?", (team_name,))
+
+
+def remove_team_related_roles(
+    guild: discord.Guild,
+    member: discord.Member,
+    team_row,
+    roster_role_type: str | None = None,
+    *,
+    remove_captain_role: bool = False
+):
+    roles_to_remove = []
+
+    team_role = guild.get_role(team_row["team_role_id"])
+    vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)
+    captain_role = guild.get_role(config.CAPTAIN_ROLE_ID)
+    player_role = guild.get_role(config.PLAYER_ROLE_ID) if config.PLAYER_ROLE_ID else None
+
+    if team_role:
+        roles_to_remove.append(team_role)
+
+    if remove_captain_role and captain_role:
+        roles_to_remove.append(captain_role)
+
+    if roster_role_type == "vice_captain" and vice_role:
+        roles_to_remove.append(vice_role)
+
+    if roster_role_type == "player" and player_role:
+        roles_to_remove.append(player_role)
+
+    if roles_to_remove:
+        try:
+            awaitable = member.remove_roles(*roles_to_remove)
+            return awaitable
+        except Exception:
+            return None
+
+
+def build_captain_changed_embed(
+    requester: discord.Member,
+    team_name: str,
+    old_captain: discord.Member | None,
+    new_captain: discord.Member
+):
+    embed = discord.Embed(
+        title="Captain Changed",
+        description=(
+            f"*manual action by {requester.mention}*\n"
+            f"Team **{team_name}** has a new captain.\n\n"
+            f"Old Captain: {old_captain.mention if old_captain else 'Not found'}\n"
+            f"New Captain: {new_captain.mention}"
+        ),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="SAVL Team System")
+    return embed
+
+
+def build_staff_add_embed(
+    requester: discord.Member,
+    player: discord.Member,
+    team_name: str,
+    role_text: str
+):
+    embed = discord.Embed(
+        title="Roster Updated",
+        description=(
+            f"*manual action by {requester.mention}*\n"
+            f"{player.mention} was added to **{team_name}** as **{role_text}**"
+        ),
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="SAVL Team System")
+    return embed
+
+
+def build_staff_remove_embed(
+    requester: discord.Member,
+    player: discord.Member,
+    team_name: str
+):
+    embed = discord.Embed(
+        title="Roster Updated",
+        description=(
+            f"*manual action by {requester.mention}*\n"
+            f"{player.mention} was removed from **{team_name}**"
+        ),
+        color=discord.Color.red()
+    )
+    embed.set_footer(text="SAVL Team System")
+    return embed
 
 
 def get_player_current_team(discord_id: int):
@@ -853,6 +953,296 @@ class TeamCog(commands.Cog):
             f"Pending transfer de {player.mention} foi limpa com sucesso.",
             ephemeral=True
         )
+
+    @team.command(name="captainchange", description="Troca o capitão de um time")
+    async def team_captainchange(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member
+    ):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not is_admin(interaction.user):
+            await interaction.response.send_message(
+                "Apenas administração pode usar esse comando.",
+                ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Guild não encontrada.", ephemeral=True)
+            return
+
+        if user.bot:
+            await interaction.response.send_message("Você não pode definir um bot como capitão.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        current_team = get_player_current_team(user.id)
+        if not current_team:
+            await interaction.followup.send(
+                "Esse usuário não está registrado em nenhum time.",
+                ephemeral=True
+            )
+            return
+
+        team_row = current_team
+
+        if team_row["captain_discord_id"] == user.id:
+            await interaction.followup.send(
+                "Esse usuário já é o capitão desse time.",
+                ephemeral=True
+            )
+            return
+
+        # Bloqueia trocar para alguém de outro time
+        roster_row = fetchone("""
+            SELECT * FROM roster
+            WHERE team_id = ? AND discord_id = ?
+        """, (team_row["id"], user.id))
+
+        if not roster_row:
+            await interaction.followup.send(
+                "Esse usuário precisa estar no roster do time para virar capitão.",
+                ephemeral=True
+            )
+            return
+
+        old_captain = guild.get_member(team_row["captain_discord_id"])
+        captain_role = guild.get_role(config.CAPTAIN_ROLE_ID)
+        vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)
+        team_role = guild.get_role(team_row["team_role_id"])
+
+        # Remove user do roster, pois agora ele será captain
+        execute("""
+            DELETE FROM roster
+            WHERE team_id = ? AND discord_id = ?
+        """, (team_row["id"], user.id))
+
+        # Capitão antigo vira player normal no roster
+        if old_captain is not None:
+            execute("""
+                INSERT INTO roster (team_id, discord_id, role_type, added_by)
+                VALUES (?, ?, 'player', ?)
+            """, (team_row["id"], old_captain.id, interaction.user.id))
+
+        # Atualiza capitão do time
+        execute("""
+            UPDATE teams
+            SET captain_discord_id = ?
+            WHERE id = ?
+        """, (user.id, team_row["id"]))
+
+        # Cargos do novo capitão
+        roles_to_add_new = []
+        if team_role and team_role not in user.roles:
+            roles_to_add_new.append(team_role)
+        if captain_role and captain_role not in user.roles:
+            roles_to_add_new.append(captain_role)
+
+        roles_to_remove_new = []
+        if roster_row["role_type"] == "vice_captain" and vice_role and vice_role in user.roles:
+            roles_to_remove_new.append(vice_role)
+        if roster_row["role_type"] == "player" and config.PLAYER_ROLE_ID:
+            player_role = guild.get_role(config.PLAYER_ROLE_ID)
+            if player_role and player_role in user.roles:
+                roles_to_remove_new.append(player_role)
+
+        if roles_to_remove_new:
+            await user.remove_roles(*roles_to_remove_new, reason=f"Captain changed by {interaction.user}")
+        if roles_to_add_new:
+            await user.add_roles(*roles_to_add_new, reason=f"Captain changed by {interaction.user}")
+
+        # Capitão antigo perde captain e recebe player
+        if old_captain is not None:
+            roles_to_remove_old = []
+            if captain_role and captain_role in old_captain.roles:
+                roles_to_remove_old.append(captain_role)
+
+            if roles_to_remove_old:
+                await old_captain.remove_roles(*roles_to_remove_old, reason=f"Captain changed by {interaction.user}")
+
+            player_role = guild.get_role(config.PLAYER_ROLE_ID) if config.PLAYER_ROLE_ID else None
+            roles_to_add_old = []
+            if team_role and team_role not in old_captain.roles:
+                roles_to_add_old.append(team_role)
+            if player_role and player_role not in old_captain.roles:
+                roles_to_add_old.append(player_role)
+
+            if roles_to_add_old:
+                await old_captain.add_roles(*roles_to_add_old, reason=f"Captain changed by {interaction.user}")
+
+        embed = build_captain_changed_embed(
+            requester=interaction.user,
+            team_name=team_row["team_name"],
+            old_captain=old_captain,
+            new_captain=user
+        )
+        await interaction.followup.send(embed=embed, ephemeral=False)
+
+
+    @team.command(name="staffadd", description="Adiciona manualmente um player a qualquer roster")
+    @app_commands.choices(role=STAFF_ROLE_CHOICES)
+    async def team_staffadd(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        role: app_commands.Choice[str],
+        team: discord.Role
+    ):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not is_admin(interaction.user):
+            await interaction.response.send_message(
+                "Apenas administração pode usar esse comando.",
+                ephemeral=True
+            )
+            return
+
+        team_row = get_team_by_role(team.id)
+        if not team_row:
+            await interaction.response.send_message(
+                "Esse time não está registrado no banco.",
+                ephemeral=True
+            )
+            return
+
+        if user.bot:
+            await interaction.response.send_message("Você não pode adicionar bots.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Guild não encontrada.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        existing_team = get_player_current_team(user.id)
+        if existing_team:
+            await interaction.followup.send(
+                "Esse usuário já está registrado em um time.",
+                ephemeral=True
+            )
+            return
+
+        execute("""
+            INSERT INTO roster (team_id, discord_id, role_type, added_by)
+            VALUES (?, ?, ?, ?)
+        """, (team_row["id"], user.id, role.value, interaction.user.id))
+
+        team_role = guild.get_role(team_row["team_role_id"])
+        vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)
+        player_role = guild.get_role(config.PLAYER_ROLE_ID) if config.PLAYER_ROLE_ID else None
+
+        roles_to_add = []
+        if team_role and team_role not in user.roles:
+            roles_to_add.append(team_role)
+
+        if role.value == "vice_captain":
+            if vice_role and vice_role not in user.roles:
+                roles_to_add.append(vice_role)
+        else:
+            if player_role and player_role not in user.roles:
+                roles_to_add.append(player_role)
+
+        if roles_to_add:
+            await user.add_roles(*roles_to_add, reason=f"Manual roster add by {interaction.user}")
+
+        role_text = "Vice Captain" if role.value == "vice_captain" else "Player"
+        embed = build_staff_add_embed(
+            requester=interaction.user,
+            player=user,
+            team_name=team_row["team_name"],
+            role_text=role_text
+        )
+        await interaction.followup.send(embed=embed, ephemeral=False)
+
+
+    @team.command(name="staffremove", description="Remove manualmente um player de qualquer roster")
+    async def team_staffremove(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        team: discord.Role
+    ):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not is_admin(interaction.user):
+            await interaction.response.send_message(
+                "Apenas administração pode usar esse comando.",
+                ephemeral=True
+            )
+            return
+
+        team_row = get_team_by_role(team.id)
+        if not team_row:
+            await interaction.response.send_message(
+                "Esse time não está registrado no banco.",
+                ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Guild não encontrada.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        if user.id == team_row["captain_discord_id"]:
+            await interaction.followup.send(
+                "Use /team captainchange para trocar o capitão. Esse comando não remove o capitão.",
+                ephemeral=True
+            )
+            return
+
+        roster_row = fetchone("""
+            SELECT * FROM roster
+            WHERE team_id = ? AND discord_id = ?
+        """, (team_row["id"], user.id))
+
+        if not roster_row:
+            await interaction.followup.send(
+                "Esse usuário não está no roster desse time.",
+                ephemeral=True
+            )
+            return
+
+        execute("""
+            DELETE FROM roster
+            WHERE team_id = ? AND discord_id = ?
+        """, (team_row["id"], user.id))
+
+        team_role = guild.get_role(team_row["team_role_id"])
+        vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)
+        player_role = guild.get_role(config.PLAYER_ROLE_ID) if config.PLAYER_ROLE_ID else None
+
+        roles_to_remove = []
+        if team_role and team_role in user.roles:
+            roles_to_remove.append(team_role)
+
+        if roster_row["role_type"] == "vice_captain":
+            if vice_role and vice_role in user.roles:
+                roles_to_remove.append(vice_role)
+        else:
+            if player_role and player_role in user.roles:
+                roles_to_remove.append(player_role)
+
+        if roles_to_remove:
+            await user.remove_roles(*roles_to_remove, reason=f"Manual roster removal by {interaction.user}")
+
+        embed = build_staff_remove_embed(
+            requester=interaction.user,
+            player=user,
+            team_name=team_row["team_name"]
+        )
+        await interaction.followup.send(embed=embed, ephemeral=False)
 
 
 async def setup(bot: commands.Bot):
