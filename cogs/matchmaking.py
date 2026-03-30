@@ -28,7 +28,7 @@ WIN_ELO = 25
 WIN_MVP_BONUS = 10
 LOSS_ELO = -20
 LOSS_MVP_ELO = -10
-
+REPLACE_LEAVE_PENALTY = -10
 
 # =========================
 # BASIC HELPERS
@@ -269,6 +269,18 @@ def init_matchmaking_tables():
         )
     """)
 
+    execute("""
+        CREATE TABLE IF NOT EXISTS mm_replacements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_number INTEGER NOT NULL,
+            old_user_id INTEGER NOT NULL,
+            new_user_id INTEGER NOT NULL,
+            replaced_by_id INTEGER NOT NULL,
+            penalty_applied INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT
+        )
+    """)
+
 
 # =========================
 # EMBED HELPERS
@@ -480,6 +492,24 @@ def build_cancelled_embed(guild: discord.Guild | None, match_row, cancelled_by_i
     return embed
 
 
+def build_cancelled_in_progress_embed(guild: discord.Guild | None, match_row, cancelled_by_id: int | None = None):
+    team_a = get_team_players(match_row["match_number"], "A")
+    team_b = get_team_players(match_row["match_number"], "B")
+
+    embed = discord.Embed(
+        title=f"Match Cancelled • #{match_row['match_number']}",
+        description="This match was cancelled after being started.",
+        color=discord.Color.red()
+    )
+    embed.add_field(name="Team A", value=build_team_lines(guild, team_a), inline=False)
+    embed.add_field(name="Team B", value=build_team_lines(guild, team_b), inline=False)
+
+    if cancelled_by_id:
+        embed.add_field(name="Cancelled by", value=mention_or_name(guild, cancelled_by_id), inline=False)
+
+    return embed
+
+
 # =========================
 # ELO / STATS UPDATE
 # =========================
@@ -549,6 +579,61 @@ def get_member_label(guild: discord.Guild | None, user_id: int, fallback: str | 
             return member.display_name[:80]
 
     return (fallback or str(user_id))[:80]
+
+
+def adjust_player_elo_only(user_id: int, season_number: int | None, delta: int):
+    ensure_mm_player(user_id)
+
+    player = fetchone("SELECT * FROM mm_players WHERE user_id = ?", (user_id,))
+    if not player:
+        return
+
+    new_elo = max(0, player["elo"] + delta)
+    elo_gained = delta if delta > 0 else 0
+    elo_lost = abs(delta) if delta < 0 else 0
+
+    execute("""
+        UPDATE mm_players
+        SET elo = ?,
+            elo_gained_total = elo_gained_total + ?,
+            elo_lost_total = elo_lost_total + ?
+        WHERE user_id = ?
+    """, (new_elo, elo_gained, elo_lost, user_id))
+
+    if season_number is not None:
+        ensure_mm_season_player(season_number, user_id)
+        execute("""
+            UPDATE mm_season_players
+            SET elo_gained = elo_gained + ?,
+                elo_lost = elo_lost + ?
+            WHERE season_number = ? AND user_id = ?
+        """, (elo_gained, elo_lost, season_number, user_id))
+
+
+def replace_match_player(match_number: int, old_user_id: int, new_user_id: int):
+    old_row = fetchone("""
+        SELECT * FROM mm_match_players
+        WHERE match_number = ? AND user_id = ?
+    """, (match_number, old_user_id))
+
+    if not old_row:
+        return False, "Old player not found."
+
+    existing_new = fetchone("""
+        SELECT * FROM mm_match_players
+        WHERE match_number = ? AND user_id = ?
+    """, (match_number, new_user_id))
+
+    if existing_new:
+        return False, "New player is already in this match."
+
+    execute("""
+        UPDATE mm_match_players
+        SET user_id = ?
+        WHERE match_number = ? AND user_id = ?
+    """, (new_user_id, match_number, old_user_id))
+
+    return True, None
 
 
 # =========================
@@ -806,69 +891,6 @@ class CaptainPickSelect(discord.ui.Select):
             await interaction.response.send_message("Apenas Match Organizer pode definir capitães.", ephemeral=True)
             return
 
-        selected_user_id = int(self.values[0])
-
-        column = "captain1_id" if self.slot == 1 else "captain2_id"
-        execute(f"""
-            UPDATE mm_matches
-            SET {column} = ?
-            WHERE match_number = ?
-        """, (selected_user_id, self.match_number))
-
-        match_row = get_match_by_number(self.match_number)
-
-        # Update original message if possible
-        try:
-            await interaction.message.edit(view=None)
-        except discord.HTTPException:
-            pass
-
-        if match_row and match_row["captain1_id"] and match_row["captain2_id"]:
-            first_picker = random.choice([match_row["captain1_id"], match_row["captain2_id"]])
-
-            execute("""
-                UPDATE mm_matches
-                SET first_picker_id = ?, status = 'draft'
-                WHERE match_number = ?
-            """, (first_picker, self.match_number))
-
-            execute("""
-                UPDATE mm_match_players
-                SET team_side = 'A', captain = 1, pick_order = 0
-                WHERE match_number = ? AND user_id = ?
-            """, (self.match_number, match_row["captain1_id"]))
-
-            execute("""
-                UPDATE mm_match_players
-                SET team_side = 'B', captain = 1, pick_order = 0
-                WHERE match_number = ? AND user_id = ?
-            """, (self.match_number, match_row["captain2_id"]))
-
-            updated = get_match_by_number(self.match_number)
-            queue_message = None
-
-            if interaction.guild and updated and updated["queue_channel_id"] and updated["queue_message_id"]:
-                channel = interaction.guild.get_channel(updated["queue_channel_id"])
-                if isinstance(channel, discord.TextChannel):
-                    try:
-                        queue_message = await channel.fetch_message(updated["queue_message_id"])
-                    except discord.HTTPException:
-                        queue_message = None
-
-            if queue_message and updated:
-                await queue_message.edit(
-                    embed=build_draft_embed(interaction.guild, updated),
-                    view=DraftView(self.cog, self.match_number)
-                )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not isinstance(interaction.user, discord.Member):
-            return
-
-        if not can_manage_matchmaking(interaction.user):
-            await interaction.response.send_message("Apenas Match Organizer pode definir capitães.", ephemeral=True)
-            return
-
         lock = self.cog.get_match_lock(self.match_number)
 
         async with lock:
@@ -887,11 +909,6 @@ class CaptainPickSelect(discord.ui.Select):
             """, (selected_user_id, self.match_number))
 
             match_row = get_match_by_number(self.match_number)
-
-            try:
-                await interaction.message.edit(view=None)
-            except discord.HTTPException:
-                pass
 
             if match_row and match_row["captain1_id"] and match_row["captain2_id"]:
                 first_picker = random.choice([match_row["captain1_id"], match_row["captain2_id"]])
@@ -915,30 +932,31 @@ class CaptainPickSelect(discord.ui.Select):
                 """, (self.match_number, match_row["captain2_id"]))
 
                 updated = get_match_by_number(self.match_number)
-                queue_message = None
 
                 if interaction.guild and updated and updated["queue_channel_id"] and updated["queue_message_id"]:
                     channel = interaction.guild.get_channel(updated["queue_channel_id"])
                     if isinstance(channel, discord.TextChannel):
                         try:
                             queue_message = await channel.fetch_message(updated["queue_message_id"])
+                            await queue_message.edit(
+                                embed=build_draft_embed(interaction.guild, updated),
+                                view=DraftView(self.cog, self.match_number)
+                            )
                         except discord.HTTPException:
-                            queue_message = None
+                            pass
 
-                if queue_message and updated:
-                    await queue_message.edit(
-                        embed=build_draft_embed(interaction.guild, updated),
-                        view=DraftView(self.cog, self.match_number)
-                    )
+                await interaction.response.send_message(
+                    f"Captain {self.slot} set successfully.",
+                    ephemeral=True
+                )
+                return
 
-            else:
-                updated = get_match_by_number(self.match_number)
-                if updated:
-                    await interaction.response.edit_message(
-                        embed=build_captains_embed(interaction.guild, updated),
-                        view=CaptainSetupView(self.cog, self.match_number)
-                    )
-                    return
+            updated = get_match_by_number(self.match_number)
+            if updated:
+                await interaction.response.send_message(
+                    f"Captain {self.slot} set successfully.",
+                    ephemeral=True
+                )
 
         await interaction.response.send_message(f"Captain {self.slot} set successfully.", ephemeral=True)
 
@@ -1196,10 +1214,16 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
 
         updated = get_match_by_number(self.match_number)
 
-        await text_channel.send(embed=build_match_started_embed(guild, updated))
+        view = InProgressMatchView(self.cog, self.match_number)
+
+        await text_channel.send(
+            embed=build_match_started_embed(guild, updated),
+            view=view
+        )
+
         await interaction.response.edit_message(
             embed=build_match_started_embed(guild, updated),
-            view=None
+            view=view
         )
 
 
@@ -1217,6 +1241,357 @@ class StartMatchView(discord.ui.View):
 
         await interaction.response.send_modal(PrivateServerModal(self.cog, self.match_number))
 
+
+class InProgressMatchView(discord.ui.View):
+    def __init__(self, cog: "MatchmakingCog", match_number: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.match_number = match_number
+
+    @discord.ui.button(label="Replace Player", style=discord.ButtonStyle.primary)
+    async def replace_player(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode substituir players.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            "Choose the player to replace:",
+            view=ReplacePlayerPickView(self.cog, self.match_number),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Finish Match", style=discord.ButtonStyle.success)
+    async def finish_match(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode finalizar a partida.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            "Choose Winner Team:",
+            view=FinishWinnerTeamView(self.cog, self.match_number),
+            ephemeral=True
+        )
+
+
+class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
+    new_player = discord.ui.TextInput(
+        label="New player mention or ID",
+        required=True,
+        placeholder="@user or user id"
+    )
+
+    def __init__(self, cog: "MatchmakingCog", match_number: int, old_user_id: int):
+        super().__init__()
+        self.cog = cog
+        self.match_number = match_number
+        self.old_user_id = old_user_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode substituir players.", ephemeral=True)
+            return
+
+        match_row = get_match_by_number(self.match_number)
+        if not match_row or match_row["status"] != "in_progress":
+            await interaction.response.send_message("This match is not in progress.", ephemeral=True)
+            return
+
+        raw = str(self.new_player).strip()
+        new_member = None
+
+        if interaction.guild:
+            if raw.startswith("<@") and raw.endswith(">"):
+                cleaned = raw.replace("<@", "").replace("!", "").replace(">", "")
+                if cleaned.isdigit():
+                    new_member = interaction.guild.get_member(int(cleaned))
+            elif raw.isdigit():
+                new_member = interaction.guild.get_member(int(raw))
+
+        if not new_member:
+            await interaction.response.send_message("Could not find that member in this server.", ephemeral=True)
+            return
+
+        if is_user_busy(new_member.id):
+            await interaction.response.send_message("This player is already in another active queue/match.", ephemeral=True)
+            return
+
+        old_row = fetchone("""
+            SELECT * FROM mm_match_players
+            WHERE match_number = ? AND user_id = ?
+        """, (self.match_number, self.old_user_id))
+        if not old_row:
+            await interaction.response.send_message("Old player not found in this match.", ephemeral=True)
+            return
+
+        season_number = match_row["season_number"]
+
+        ok, error = replace_match_player(self.match_number, self.old_user_id, new_member.id)
+        if not ok:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        
+        execute("""
+            INSERT INTO mm_replacements (
+                match_number, old_user_id, new_user_id, replaced_by_id, penalty_applied, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            self.match_number,
+            self.old_user_id,
+            new_member.id,
+            interaction.user.id,
+            abs(REPLACE_LEAVE_PENALTY),
+            now_str()
+        ))
+
+        adjust_player_elo_only(self.old_user_id, season_number, REPLACE_LEAVE_PENALTY)
+
+        updated = get_match_by_number(self.match_number)
+
+        guild = interaction.guild
+        if guild:
+            old_member = guild.get_member(self.old_user_id)
+            team_side = old_row["team_side"]
+
+            if updated["text_channel_id"]:
+                text_channel = guild.get_channel(updated["text_channel_id"])
+                if isinstance(text_channel, discord.TextChannel):
+                    try:
+                        await text_channel.set_permissions(
+                            new_member,
+                            view_channel=True,
+                            send_messages=True
+                        )
+                        if old_member:
+                            await text_channel.set_permissions(old_member, overwrite=None)
+                    except discord.HTTPException:
+                        pass
+
+            voice_channel_id = updated["team_a_voice_id"] if team_side == "A" else updated["team_b_voice_id"]
+            voice_channel = guild.get_channel(voice_channel_id)
+            if isinstance(voice_channel, discord.VoiceChannel):
+                try:
+                    await voice_channel.set_permissions(
+                        new_member,
+                        view_channel=True,
+                        connect=True
+                    )
+                    if old_member:
+                        await voice_channel.set_permissions(old_member, overwrite=None)
+                except discord.HTTPException:
+                    pass
+            if updated["queue_channel_id"] and updated["queue_message_id"]:
+                queue_channel = guild.get_channel(updated["queue_channel_id"])
+                if isinstance(queue_channel, discord.TextChannel):
+                    try:
+                        queue_message = await queue_channel.fetch_message(updated["queue_message_id"])
+                        await queue_message.edit(
+                            embed=build_match_started_embed(guild, updated),
+                            view=InProgressMatchView(self.cog, self.match_number)
+                        )
+                    except discord.HTTPException:
+                        pass
+
+            if updated["text_channel_id"]:
+                text_channel = guild.get_channel(updated["text_channel_id"])
+                if isinstance(text_channel, discord.TextChannel):
+                    try:
+                        await text_channel.send(
+                            f"{mention_or_name(guild, self.old_user_id)} was replaced by {new_member.mention}. "
+                            f"Penalty applied: `{REPLACE_LEAVE_PENALTY}` ELO."
+                        )
+                    except discord.HTTPException:
+                        pass
+
+        await interaction.response.send_message(
+            f"Player replaced successfully. {mention_or_name(guild, self.old_user_id)} received `{REPLACE_LEAVE_PENALTY}` ELO.",
+            ephemeral=True
+        )
+
+
+class ReplacePlayerSelect(discord.ui.Select):
+    def __init__(self, cog: "MatchmakingCog", match_number: int):
+        self.cog = cog
+        self.match_number = match_number
+
+        guild = cog.bot.get_guild(config.GUILD_ID)
+        players = get_match_players(match_number)
+
+        options = []
+        for row in players:
+            label = get_member_label(guild, row["user_id"])
+            team_label = team_side_label(row["team_side"]) if row["team_side"] else "No Team"
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=str(row["user_id"]),
+                    description=f"{team_label} • {row['role_pref']}"[:100]
+                )
+            )
+
+        super().__init__(
+            placeholder="Select the player to replace",
+            min_values=1,
+            max_values=1,
+            options=options[:25]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode substituir players.", ephemeral=True)
+            return
+
+        old_user_id = int(self.values[0])
+        await interaction.response.send_modal(
+            ReplacePlayerModal(self.cog, self.match_number, old_user_id)
+        )
+
+
+class ReplacePlayerPickView(discord.ui.View):
+    def __init__(self, cog: "MatchmakingCog", match_number: int):
+        super().__init__(timeout=120)
+        self.add_item(ReplacePlayerSelect(cog, match_number))
+
+
+class FinishWinnerTeamSelect(discord.ui.Select):
+    def __init__(self, cog: "MatchmakingCog", match_number: int):
+        self.cog = cog
+        self.match_number = match_number
+        super().__init__(
+            placeholder="Select Winner Team",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="Team A", value="A"),
+                discord.SelectOption(label="Team B", value="B"),
+            ]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode finalizar partidas.", ephemeral=True)
+            return
+
+        winner_side = self.values[0]
+        loser_side = "B" if winner_side == "A" else "A"
+
+        await interaction.response.edit_message(
+            content=f"Winner Team: **{team_side_label(winner_side)}**\nNow choose Winner MVP.",
+            view=FinishWmvpView(self.cog, self.match_number, winner_side, loser_side)
+        )
+
+
+class FinishWinnerTeamView(discord.ui.View):
+    def __init__(self, cog: "MatchmakingCog", match_number: int):
+        super().__init__(timeout=120)
+        self.add_item(FinishWinnerTeamSelect(cog, match_number))
+
+
+class FinishWmvpSelect(discord.ui.Select):
+    def __init__(self, cog: "MatchmakingCog", match_number: int, winner_side: str, loser_side: str):
+        self.cog = cog
+        self.match_number = match_number
+        self.winner_side = winner_side
+        self.loser_side = loser_side
+
+        guild = cog.bot.get_guild(config.GUILD_ID)
+        players = get_team_players(match_number, winner_side)
+
+        options = [
+            discord.SelectOption(
+                label=get_member_label(guild, row["user_id"]),
+                value=str(row["user_id"]),
+                description=row["role_pref"][:100]
+            )
+            for row in players
+        ]
+
+        super().__init__(
+            placeholder="Select Winner MVP",
+            min_values=1,
+            max_values=1,
+            options=options[:25]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        wmvp_id = int(self.values[0])
+
+        await interaction.response.edit_message(
+            content=(
+                f"Winner Team: **{team_side_label(self.winner_side)}**\n"
+                f"Winner MVP selected.\n"
+                f"Now choose Loser MVP."
+            ),
+            view=FinishLmvpView(self.cog, self.match_number, self.winner_side, self.loser_side, wmvp_id)
+        )
+
+
+class FinishWmvpView(discord.ui.View):
+    def __init__(self, cog: "MatchmakingCog", match_number: int, winner_side: str, loser_side: str):
+        super().__init__(timeout=120)
+        self.add_item(FinishWmvpSelect(cog, match_number, winner_side, loser_side))
+
+
+class FinishLmvpSelect(discord.ui.Select):
+    def __init__(self, cog: "MatchmakingCog", match_number: int, winner_side: str, loser_side: str, wmvp_id: int):
+        self.cog = cog
+        self.match_number = match_number
+        self.winner_side = winner_side
+        self.loser_side = loser_side
+        self.wmvp_id = wmvp_id
+
+        guild = cog.bot.get_guild(config.GUILD_ID)
+        players = get_team_players(match_number, loser_side)
+
+        options = [
+            discord.SelectOption(
+                label=get_member_label(guild, row["user_id"]),
+                value=str(row["user_id"]),
+                description=row["role_pref"][:100]
+            )
+            for row in players
+        ]
+
+        super().__init__(
+            placeholder="Select Loser MVP",
+            min_values=1,
+            max_values=1,
+            options=options[:25]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode finalizar partidas.", ephemeral=True)
+            return
+
+        lmvp_id = int(self.values[0])
+        await interaction.response.defer(ephemeral=True)
+
+        ok, error = await self.cog.finalize_match(
+            interaction=interaction,
+            match_number=self.match_number,
+            winner_side=self.winner_side,
+            loser_side=self.loser_side,
+            wmvp_id=self.wmvp_id,
+            lmvp_id=lmvp_id
+        )
+
+        if not ok:
+            await interaction.followup.send(error, ephemeral=True)
+            return
+
+        try:
+            await interaction.message.edit(content="Match finished.", view=None)
+        except discord.HTTPException:
+            pass
+
+        await interaction.followup.send(f"Match #{self.match_number} finished successfully.", ephemeral=True)
+
+
+class FinishLmvpView(discord.ui.View):
+    def __init__(self, cog: "MatchmakingCog", match_number: int, winner_side: str, loser_side: str, wmvp_id: int):
+        super().__init__(timeout=120)
+        self.add_item(FinishLmvpSelect(cog, match_number, winner_side, loser_side, wmvp_id))
 
 # =========================
 # MAIN COG
@@ -1459,9 +1834,9 @@ class MatchmakingCog(commands.Cog):
             await interaction.response.send_message("Match not found.", ephemeral=True)
             return
 
-        if match_row["status"] not in ("queue_open", "captains_pending", "draft", "ready_to_start"):
+        if match_row["status"] not in ("queue_open", "captains_pending", "draft", "ready_to_start", "in_progress"):
             await interaction.response.send_message(
-                "Only queues that have not started yet can be cancelled.",
+                "Only active queues or in-progress matches can be cancelled.",
                 ephemeral=True
             )
             return
@@ -1475,6 +1850,8 @@ class MatchmakingCog(commands.Cog):
             WHERE match_number = ?
         """, (now_str(), number))
 
+        previous_status = match_row["status"]
+
         updated = get_match_by_number(number)
         guild = interaction.guild
 
@@ -1483,12 +1860,27 @@ class MatchmakingCog(commands.Cog):
             if isinstance(queue_channel, discord.TextChannel):
                 try:
                     queue_message = await queue_channel.fetch_message(updated["queue_message_id"])
+                    embed = (
+                        build_cancelled_in_progress_embed(guild, updated, interaction.user.id)
+                        if previous_status == "in_progress"
+                        else build_cancelled_embed(guild, updated, interaction.user.id)
+                    )
+
                     await queue_message.edit(
-                        embed=build_cancelled_embed(guild, updated, interaction.user.id),
+                        embed=embed,
                         view=None
                     )
                 except discord.HTTPException:
                     pass
+            for channel_id in [updated["text_channel_id"], updated["team_a_voice_id"], updated["team_b_voice_id"]]:
+                if not channel_id:
+                    continue
+                channel = guild.get_channel(channel_id)
+                if channel:
+                    try:
+                        await channel.delete(reason=f"Match Making #{number} cancelled")
+                    except discord.HTTPException:
+                        pass
 
         await interaction.followup.send(
             f"Match Making queue #{number} cancelled successfully.",
@@ -1517,106 +1909,20 @@ class MatchmakingCog(commands.Cog):
             await interaction.response.send_message("Winner team and loser team must be different.", ephemeral=True)
             return
 
-        match_row = get_match_by_number(number)
-        if not match_row:
-            await interaction.response.send_message("Match not found.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+
+        ok, error = await self.finalize_match(
+            interaction=interaction,
+            match_number=number,
+            winner_side=winner_team.value,
+            loser_side=loser_team.value,
+            wmvp_id=wmvp.id,
+            lmvp_id=lmvp.id
+        )
+
+        if not ok:
+            await interaction.followup.send(error, ephemeral=True)
             return
-
-        if match_row["status"] != "in_progress":
-            await interaction.response.send_message("This match is not currently in progress.", ephemeral=True)
-            return
-
-        wmvp_row = fetchone("""
-            SELECT * FROM mm_match_players
-            WHERE match_number = ? AND user_id = ? AND team_side = ?
-        """, (number, wmvp.id, winner_team.value))
-
-        lmvp_row = fetchone("""
-            SELECT * FROM mm_match_players
-            WHERE match_number = ? AND user_id = ? AND team_side = ?
-        """, (number, lmvp.id, loser_team.value))
-
-        if not wmvp_row:
-            await interaction.response.send_message("WMVP must belong to the winner team.", ephemeral=True)
-            return
-
-        if not lmvp_row:
-            await interaction.response.send_message("LMVP must belong to the loser team.", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-
-        players = get_match_players(number)
-        season_number = match_row["season_number"]
-
-        for row in players:
-            if row["team_side"] == winner_team.value:
-                delta = WIN_ELO + (WIN_MVP_BONUS if row["user_id"] == wmvp.id else 0)
-                apply_match_result_to_player(
-                    user_id=row["user_id"],
-                    season_number=season_number,
-                    delta=delta,
-                    is_win=True,
-                    is_win_mvp=(row["user_id"] == wmvp.id),
-                    is_loss_mvp=False
-                )
-            else:
-                delta = LOSS_MVP_ELO if row["user_id"] == lmvp.id else LOSS_ELO
-                apply_match_result_to_player(
-                    user_id=row["user_id"],
-                    season_number=season_number,
-                    delta=delta,
-                    is_win=False,
-                    is_win_mvp=False,
-                    is_loss_mvp=(row["user_id"] == lmvp.id)
-                )
-
-        execute("""
-            UPDATE mm_matches
-            SET status = 'finished',
-                winner_side = ?,
-                loser_side = ?,
-                wmvp_id = ?,
-                lmvp_id = ?,
-                finished_at = ?
-            WHERE match_number = ?
-        """, (
-            winner_team.value,
-            loser_team.value,
-            wmvp.id,
-            lmvp.id,
-            now_str(),
-            number
-        ))
-
-        updated = get_match_by_number(number)
-        guild = interaction.guild
-
-        if guild is not None:
-            results_channel = guild.get_channel(MM_RESULTS_CHANNEL_ID)
-            if isinstance(results_channel, discord.TextChannel):
-                await results_channel.send(embed=build_result_embed(guild, updated))
-
-            # Update queue message
-            if updated["queue_channel_id"] and updated["queue_message_id"]:
-                queue_channel = guild.get_channel(updated["queue_channel_id"])
-                if isinstance(queue_channel, discord.TextChannel):
-                    try:
-                        queue_message = await queue_channel.fetch_message(updated["queue_message_id"])
-                        await queue_message.edit(embed=build_result_embed(guild, updated), view=None)
-                    except discord.HTTPException:
-                        pass
-
-            # Delete temporary channels
-            for channel_id in [updated["text_channel_id"], updated["team_a_voice_id"], updated["team_b_voice_id"]]:
-                if not channel_id:
-                    continue
-                channel = guild.get_channel(channel_id)
-                if channel:
-                    try:
-                        await channel.delete(reason=f"Match Making #{number} finished")
-                    except discord.HTTPException:
-                        pass
 
         await interaction.followup.send(f"Match #{number} finished successfully.", ephemeral=True)
 
@@ -1661,6 +1967,111 @@ class MatchmakingCog(commands.Cog):
                 )
 
         await interaction.response.send_message(embed=embed)
+
+    async def finalize_match(
+        self,
+        interaction: discord.Interaction,
+        match_number: int,
+        winner_side: str,
+        loser_side: str,
+        wmvp_id: int,
+        lmvp_id: int
+    ):
+        match_row = get_match_by_number(match_number)
+        if not match_row:
+            return False, "Match not found."
+
+        if match_row["status"] != "in_progress":
+            return False, "This match is not currently in progress."
+
+        wmvp_row = fetchone("""
+            SELECT * FROM mm_match_players
+            WHERE match_number = ? AND user_id = ? AND team_side = ?
+        """, (match_number, wmvp_id, winner_side))
+
+        lmvp_row = fetchone("""
+            SELECT * FROM mm_match_players
+            WHERE match_number = ? AND user_id = ? AND team_side = ?
+        """, (match_number, lmvp_id, loser_side))
+
+        if not wmvp_row:
+            return False, "WMVP must belong to the winner team."
+
+        if not lmvp_row:
+            return False, "LMVP must belong to the loser team."
+
+        players = get_match_players(match_number)
+        season_number = match_row["season_number"]
+
+        for row in players:
+            if row["team_side"] == winner_side:
+                delta = WIN_ELO + (WIN_MVP_BONUS if row["user_id"] == wmvp_id else 0)
+                apply_match_result_to_player(
+                    user_id=row["user_id"],
+                    season_number=season_number,
+                    delta=delta,
+                    is_win=True,
+                    is_win_mvp=(row["user_id"] == wmvp_id),
+                    is_loss_mvp=False
+                )
+            else:
+                delta = LOSS_MVP_ELO if row["user_id"] == lmvp_id else LOSS_ELO
+                apply_match_result_to_player(
+                    user_id=row["user_id"],
+                    season_number=season_number,
+                    delta=delta,
+                    is_win=False,
+                    is_win_mvp=False,
+                    is_loss_mvp=(row["user_id"] == lmvp_id)
+                )
+
+        execute("""
+            UPDATE mm_matches
+            SET status = 'finished',
+                winner_side = ?,
+                loser_side = ?,
+                wmvp_id = ?,
+                lmvp_id = ?,
+                finished_at = ?
+            WHERE match_number = ?
+        """, (
+            winner_side,
+            loser_side,
+            wmvp_id,
+            lmvp_id,
+            now_str(),
+            match_number
+        ))
+
+        updated = get_match_by_number(match_number)
+        guild = interaction.guild
+
+        if guild is not None:
+            results_channel = guild.get_channel(MM_RESULTS_CHANNEL_ID)
+            if isinstance(results_channel, discord.TextChannel):
+                await results_channel.send(embed=build_result_embed(guild, updated))
+
+            if updated["queue_channel_id"] and updated["queue_message_id"]:
+                queue_channel = guild.get_channel(updated["queue_channel_id"])
+                if isinstance(queue_channel, discord.TextChannel):
+                    try:
+                        queue_message = await queue_channel.fetch_message(updated["queue_message_id"])
+                        await queue_message.edit(embed=build_result_embed(guild, updated), view=None)
+                    except discord.HTTPException:
+                        pass
+
+            for channel_id in [updated["text_channel_id"], updated["team_a_voice_id"], updated["team_b_voice_id"]]:
+                if not channel_id:
+                    continue
+                channel = guild.get_channel(channel_id)
+                if channel:
+                    try:
+                        await channel.delete(reason=f"Match Making #{match_number} finished")
+                    except discord.HTTPException:
+                        pass
+
+        return True, None
+
 
     @mm.command(name="leaderboard", description="Shows the Match Making leaderboard")
     async def mm_leaderboard(self, interaction: discord.Interaction, page: int = 1, season_number: int | None = None):
@@ -1714,6 +2125,56 @@ class MatchmakingCog(commands.Cog):
         )
         embed.set_footer(text=f"Page {page}")
         await interaction.response.send_message(embed=embed)
+
+
+    @mm.command(name="addelo", description="Adds Match Making ELO to a player")
+    async def mm_addelo(self, interaction: discord.Interaction, elo: int, user: discord.Member):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode ajustar ELO.", ephemeral=True)
+            return
+
+        if elo <= 0:
+            await interaction.response.send_message("ELO must be greater than 0.", ephemeral=True)
+            return
+
+        season_row = get_active_season()
+        season_number = season_row["number"] if season_row else None
+
+        adjust_player_elo_only(user.id, season_number, elo)
+        row = fetchone("SELECT * FROM mm_players WHERE user_id = ?", (user.id,))
+
+        await interaction.response.send_message(
+            f"Added `{elo}` ELO to {user.mention}. New ELO: `{row['elo']}`",
+            ephemeral=True
+        )
+
+
+    @mm.command(name="removeelo", description="Removes Match Making ELO from a player")
+    async def mm_removeelo(self, interaction: discord.Interaction, elo: int, user: discord.Member):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode ajustar ELO.", ephemeral=True)
+            return
+
+        if elo <= 0:
+            await interaction.response.send_message("ELO must be greater than 0.", ephemeral=True)
+            return
+
+        season_row = get_active_season()
+        season_number = season_row["number"] if season_row else None
+
+        adjust_player_elo_only(user.id, season_number, -elo)
+        row = fetchone("SELECT * FROM mm_players WHERE user_id = ?", (user.id,))
+
+        await interaction.response.send_message(
+            f"Removed `{elo}` ELO from {user.mention}. New ELO: `{row['elo']}`",
+            ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):
