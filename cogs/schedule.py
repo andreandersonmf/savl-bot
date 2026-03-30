@@ -17,17 +17,13 @@ def is_admin(member: discord.Member) -> bool:
     return member.guild_permissions.administrator
 
 
-def parse_next_match_datetime(time_brt: str) -> datetime | None:
+def parse_match_datetime(date_brt: str, time_brt: str) -> datetime | None:
     try:
+        day, month, year = map(int, date_brt.split("/"))
         hour, minute = map(int, time_brt.split(":"))
+        target = datetime(year, month, day, hour, minute, tzinfo=BRT)
     except ValueError:
         return None
-
-    now = datetime.now(BRT)
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-    if target <= now:
-        target += timedelta(days=1)
 
     return target
 
@@ -90,27 +86,51 @@ class ScheduleCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     @schedule.command(name="match", description="Agenda uma partida")
+    @app_commands.describe(
+        team1="Primeiro time",
+        team2="Segundo time",
+        date_brt="Data da partida no formato DD/MM/YYYY",
+        time_brt="Horário da partida no formato HH:MM"
+    )
     async def schedule_match(
         self,
         interaction: discord.Interaction,
         team1: discord.Role,
         team2: discord.Role,
+        date_brt: str,
         time_brt: str
     ):
         if not isinstance(interaction.user, discord.Member):
             return
 
         if not is_admin(interaction.user):
-            await interaction.response.send_message("Apenas administração pode usar esse comando.", ephemeral=True)
+            await interaction.response.send_message(
+                "Apenas administração pode usar esse comando.",
+                ephemeral=True
+            )
             return
 
         if team1.id == team2.id:
-            await interaction.response.send_message("Os dois times não podem ser o mesmo.", ephemeral=True)
+            await interaction.response.send_message(
+                "Os dois times não podem ser o mesmo.",
+                ephemeral=True
+            )
             return
 
-        target_dt = parse_next_match_datetime(time_brt)
+        target_dt = parse_match_datetime(date_brt, time_brt)
         if target_dt is None:
-            await interaction.response.send_message("Formato de horário inválido. Use HH:MM, por exemplo 16:00", ephemeral=True)
+            await interaction.response.send_message(
+                "Formato inválido.\nUse a data como **DD/MM/YYYY** e o horário como **HH:MM**.\nExemplo: `05/04/2026` e `16:00`",
+                ephemeral=True
+            )
+            return
+
+        now = datetime.now(BRT)
+        if target_dt <= now:
+            await interaction.response.send_message(
+                "A data/horário informado já passou. Informe um horário futuro.",
+                ephemeral=True
+            )
             return
 
         schedule_id = execute("""
@@ -133,7 +153,7 @@ class ScheduleCog(commands.Cog):
         )
         embed.add_field(name="Match ID", value=str(schedule_id), inline=True)
         embed.add_field(name="Teams", value=f"{team1.mention} vs {team2.mention}", inline=False)
-        embed.add_field(name="Time (BRT)", value=target_dt.strftime("%d/%m/%Y %H:%M"), inline=False)
+        embed.add_field(name="Date & Time (BRT)", value=target_dt.strftime("%d/%m/%Y %H:%M"), inline=False)
         embed.set_footer(text="15 minutes reminder enabled")
 
         await interaction.response.send_message(embed=embed)
@@ -144,7 +164,10 @@ class ScheduleCog(commands.Cog):
             return
 
         if not is_admin(interaction.user):
-            await interaction.response.send_message("Apenas administração pode usar esse comando.", ephemeral=True)
+            await interaction.response.send_message(
+                "Apenas administração pode usar esse comando.",
+                ephemeral=True
+            )
             return
 
         rows = fetchall("""
@@ -177,7 +200,10 @@ class ScheduleCog(commands.Cog):
             return
 
         if not is_admin(interaction.user):
-            await interaction.response.send_message("Apenas administração pode usar esse comando.", ephemeral=True)
+            await interaction.response.send_message(
+                "Apenas administração pode usar esse comando.",
+                ephemeral=True
+            )
             return
 
         row = fetchone("SELECT * FROM schedules WHERE id = ?", (match_id,))
