@@ -4,6 +4,7 @@ from datetime import datetime
 import random
 import asyncio
 import sqlite3
+import re
 
 import discord
 from discord import app_commands
@@ -20,14 +21,15 @@ from database import execute, fetchone, fetchall
 MATCH_ORGANIZER_ROLE_ID = getattr(config, "MATCH_ORGANIZER_ROLE_ID", 1486904493080711218)
 MATCHMAKING_CATEGORY_ID = getattr(config, "MATCHMAKING_CATEGORY_ID", 1484645219059372163)
 MM_RESULTS_CHANNEL_ID = getattr(config, "MM_RESULTS_CHANNEL_ID", 1486900210436276294)
+ELO_UPDATE_CHANNEL_ID = getattr(config, "ELO_UPDATE_CHANNEL_ID", 1488320697808851054)
 
 MAX_SETTERS = 4
 MAX_SPIKERS = 8
 
-WIN_ELO = 25
-WIN_MVP_BONUS = 10
-LOSS_ELO = -20
-LOSS_MVP_ELO = -10
+BASE_WIN_ELO = 18
+BASE_LOSS_ELO = -16
+WMVP_BONUS = 6
+LMVP_REDUCTION = 6
 REPLACE_LEAVE_PENALTY = -10
 
 # =========================
@@ -135,6 +137,13 @@ def get_available_players(match_number: int):
             CASE role_pref WHEN 'setter' THEN 0 ELSE 1 END,
             id ASC
     """, (match_number,))
+
+
+def ensure_column_exists(table_name: str, column_name: str, column_sql: str):
+    cols = fetchall(f"PRAGMA table_info({table_name})")
+    existing = {col["name"] for col in cols}
+    if column_name not in existing:
+        execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
 
 
 def count_team_role(match_number: int, side: str, role_pref: str) -> int:
@@ -280,6 +289,118 @@ def init_matchmaking_tables():
             created_at TEXT
         )
     """)
+
+    ensure_column_exists("mm_matches", "final_score_text", "TEXT")
+
+
+def format_elo_delta(delta: int) -> str:
+    return f"+{delta}" if delta > 0 else str(delta)
+
+
+def parse_final_score(final_score_text: str) -> tuple[list[tuple[int, int]] | None, str | None]:
+    """
+    Formato esperado:
+    Team A - Team B em cada set
+
+    Exemplos válidos:
+    25-20
+    25-20, 22-25, 15-11
+    25-21 | 25-18
+    25:21, 25:18
+    25x21, 25x18
+    """
+    raw = final_score_text.strip()
+    if not raw:
+        return None, "Final Score cannot be empty."
+
+    parts = [p.strip() for p in re.split(r"[,|\n;]+", raw) if p.strip()]
+    if not parts:
+        return None, "Invalid Final Score format."
+
+    set_scores: list[tuple[int, int]] = []
+
+    for part in parts:
+        normalized = re.sub(r"\s*[xX:]\s*", "-", part)
+        match = re.fullmatch(r"(\d{1,2})\s*-\s*(\d{1,2})", normalized)
+        if not match:
+            return None, (
+                "Invalid Final Score format. Use Team A - Team B for each set. "
+                "Example: `25-20, 22-25, 15-11`"
+            )
+
+        a_score = int(match.group(1))
+        b_score = int(match.group(2))
+
+        if a_score == b_score:
+            return None, "A set cannot end in a tie."
+
+        if a_score < 0 or b_score < 0:
+            return None, "Scores cannot be negative."
+
+        set_scores.append((a_score, b_score))
+
+    return set_scores, None
+
+
+def count_set_wins(set_scores: list[tuple[int, int]]) -> tuple[int, int]:
+    team_a_wins = 0
+    team_b_wins = 0
+
+    for a_score, b_score in set_scores:
+        if a_score > b_score:
+            team_a_wins += 1
+        else:
+            team_b_wins += 1
+
+    return team_a_wins, team_b_wins
+
+
+def get_margin_bonus(avg_margin: float) -> int:
+    if avg_margin >= 15:
+        return 8
+    if avg_margin >= 11:
+        return 6
+    if avg_margin >= 7:
+        return 4
+    if avg_margin >= 4:
+        return 2
+    return 0
+
+
+def calculate_match_team_deltas(
+    set_scores: list[tuple[int, int]],
+    winner_side: str
+) -> tuple[dict | None, str | None]:
+    team_a_wins, team_b_wins = count_set_wins(set_scores)
+
+    if team_a_wins == team_b_wins:
+        return None, "Final Score is tied in sets. A match must have a winner."
+
+    actual_winner = "A" if team_a_wins > team_b_wins else "B"
+    if actual_winner != winner_side:
+        return None, (
+            f"The selected winner team does not match the Final Score. "
+            f"Score indicates Team {actual_winner} as winner."
+        )
+
+    total_margin = sum(abs(a - b) for a, b in set_scores)
+    avg_margin = total_margin / len(set_scores)
+    dominance_bonus = get_margin_bonus(avg_margin)
+
+    winner_delta = BASE_WIN_ELO + dominance_bonus
+    loser_delta = BASE_LOSS_ELO - round(dominance_bonus * 0.75)
+
+    final_score_display = " | ".join(f"{a}-{b}" for a, b in set_scores)
+
+    return {
+        "team_a_sets": team_a_wins,
+        "team_b_sets": team_b_wins,
+        "avg_margin": avg_margin,
+        "dominance_bonus": dominance_bonus,
+        "winner_delta": winner_delta,
+        "loser_delta": loser_delta,
+        "final_score_display": final_score_display,
+    }, None
 
 
 # =========================
@@ -455,6 +576,11 @@ def build_result_embed(guild: discord.Guild | None, match_row):
         title=f"Match Result • #{match_row['match_number']}",
         color=discord.Color.purple()
     )
+
+    final_score_text = match_row["final_score_text"] if "final_score_text" in match_row.keys() else None
+    if final_score_text:
+        embed.add_field(name="Final Score", value=final_score_text, inline=False)
+
     embed.add_field(
         name=f"{team_side_label(match_row['winner_side'])} • Winner",
         value=build_team_lines(guild, winners, wmvp_id=match_row["wmvp_id"]),
@@ -466,6 +592,58 @@ def build_result_embed(guild: discord.Guild | None, match_row):
         inline=False
     )
     embed.set_footer(text="SAVL Match Making Results")
+    return embed
+
+
+def build_elo_update_embed(guild: discord.Guild | None, match_row, elo_changes: list[dict]):
+    winners = []
+    losers = []
+
+    for change in elo_changes:
+        row = fetchone("""
+            SELECT team_side FROM mm_match_players
+            WHERE match_number = ? AND user_id = ?
+        """, (match_row["match_number"], change["user_id"]))
+
+        if not row:
+            continue
+
+        tags = []
+        if change["is_win_mvp"]:
+            tags.append("WMVP")
+        if change["is_loss_mvp"]:
+            tags.append("LMVP")
+
+        suffix = f" ({', '.join(tags)})" if tags else ""
+        line = (
+            f"{mention_or_name(guild, change['user_id'])}{suffix} • "
+            f"`{format_elo_delta(change['delta'])}` → `{change['new_elo']}`"
+        )
+
+        if row["team_side"] == match_row["winner_side"]:
+            winners.append(line)
+        else:
+            losers.append(line)
+
+    embed = discord.Embed(
+        title=f"ELO Update • Match #{match_row['match_number']}",
+        color=discord.Color.orange()
+    )
+
+    if match_row["final_score_text"]:
+        embed.add_field(name="Final Score", value=match_row["final_score_text"], inline=False)
+
+    embed.add_field(
+        name=f"{team_side_label(match_row['winner_side'])} • Gained",
+        value="\n".join(winners) if winners else "—",
+        inline=False
+    )
+    embed.add_field(
+        name=f"{team_side_label(match_row['loser_side'])} • Lost",
+        value="\n".join(losers) if losers else "—",
+        inline=False
+    )
+    embed.set_footer(text="ELO after match finish")
     return embed
 
 
@@ -514,14 +692,23 @@ def build_cancelled_in_progress_embed(guild: discord.Guild | None, match_row, ca
 # ELO / STATS UPDATE
 # =========================
 
-def apply_match_result_to_player(user_id: int, season_number: int | None, delta: int, is_win: bool, is_win_mvp: bool, is_loss_mvp: bool):
+
+def apply_match_result_to_player(
+    user_id: int,
+    season_number: int | None,
+    delta: int,
+    is_win: bool,
+    is_win_mvp: bool,
+    is_loss_mvp: bool
+):
     ensure_mm_player(user_id)
 
     player = fetchone("SELECT * FROM mm_players WHERE user_id = ?", (user_id,))
     if not player:
-        return
+        return None
 
-    new_elo = max(0, player["elo"] + delta)
+    old_elo = player["elo"]
+    new_elo = max(0, old_elo + delta)
     elo_gained = delta if delta > 0 else 0
     elo_lost = abs(delta) if delta < 0 else 0
 
@@ -570,6 +757,16 @@ def apply_match_result_to_player(user_id: int, season_number: int | None, delta:
             season_number,
             user_id
         ))
+
+    return {
+        "user_id": user_id,
+        "old_elo": old_elo,
+        "new_elo": new_elo,
+        "delta": delta,
+        "is_win": is_win,
+        "is_win_mvp": is_win_mvp,
+        "is_loss_mvp": is_loss_mvp,
+    }
 
 
 def get_member_label(guild: discord.Guild | None, user_id: int, fallback: str | None = None) -> str:
@@ -1565,6 +1762,55 @@ class FinishLmvpSelect(discord.ui.Select):
             return
 
         lmvp_id = int(self.values[0])
+
+        await interaction.response.send_modal(
+            FinishScoreModal(
+                cog=self.cog,
+                match_number=self.match_number,
+                winner_side=self.winner_side,
+                loser_side=self.loser_side,
+                wmvp_id=self.wmvp_id,
+                lmvp_id=lmvp_id
+            )
+        )
+
+
+class FinishLmvpView(discord.ui.View):
+    def __init__(self, cog: "MatchmakingCog", match_number: int, winner_side: str, loser_side: str, wmvp_id: int):
+        super().__init__(timeout=120)
+        self.add_item(FinishLmvpSelect(cog, match_number, winner_side, loser_side, wmvp_id))
+
+
+class FinishScoreModal(discord.ui.Modal, title="Finish Match"):
+    final_score = discord.ui.TextInput(
+        label="Final Score (Team A - Team B)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        placeholder="Example: 25-20, 22-25, 15-11"
+    )
+
+    def __init__(
+        self,
+        cog: "MatchmakingCog",
+        match_number: int,
+        winner_side: str,
+        loser_side: str,
+        wmvp_id: int,
+        lmvp_id: int
+    ):
+        super().__init__()
+        self.cog = cog
+        self.match_number = match_number
+        self.winner_side = winner_side
+        self.loser_side = loser_side
+        self.wmvp_id = wmvp_id
+        self.lmvp_id = lmvp_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
+            await interaction.response.send_message("Apenas Match Organizer pode finalizar partidas.", ephemeral=True)
+            return
+
         await interaction.response.defer(ephemeral=True)
 
         ok, error = await self.cog.finalize_match(
@@ -1573,25 +1819,18 @@ class FinishLmvpSelect(discord.ui.Select):
             winner_side=self.winner_side,
             loser_side=self.loser_side,
             wmvp_id=self.wmvp_id,
-            lmvp_id=lmvp_id
+            lmvp_id=self.lmvp_id,
+            final_score_text=str(self.final_score).strip()
         )
 
         if not ok:
             await interaction.followup.send(error, ephemeral=True)
             return
 
-        try:
-            await interaction.message.edit(content="Match finished.", view=None)
-        except discord.HTTPException:
-            pass
-
-        await interaction.followup.send(f"Match #{self.match_number} finished successfully.", ephemeral=True)
-
-
-class FinishLmvpView(discord.ui.View):
-    def __init__(self, cog: "MatchmakingCog", match_number: int, winner_side: str, loser_side: str, wmvp_id: int):
-        super().__init__(timeout=120)
-        self.add_item(FinishLmvpSelect(cog, match_number, winner_side, loser_side, wmvp_id))
+        await interaction.followup.send(
+            f"Match #{self.match_number} finished successfully.",
+            ephemeral=True
+        )
 
 # =========================
 # MAIN COG
@@ -1896,7 +2135,8 @@ class MatchmakingCog(commands.Cog):
         winner_team: app_commands.Choice[str],
         loser_team: app_commands.Choice[str],
         wmvp: discord.Member,
-        lmvp: discord.Member
+        lmvp: discord.Member,
+        final_score: str
     ):
         if not isinstance(interaction.user, discord.Member):
             return
@@ -1917,7 +2157,8 @@ class MatchmakingCog(commands.Cog):
             winner_side=winner_team.value,
             loser_side=loser_team.value,
             wmvp_id=wmvp.id,
-            lmvp_id=lmvp.id
+            lmvp_id=lmvp.id,
+            final_score_text=final_score
         )
 
         if not ok:
@@ -1975,7 +2216,8 @@ class MatchmakingCog(commands.Cog):
         winner_side: str,
         loser_side: str,
         wmvp_id: int,
-        lmvp_id: int
+        lmvp_id: int,
+        final_score_text: str
     ):
         match_row = get_match_by_number(match_number)
         if not match_row:
@@ -1983,6 +2225,14 @@ class MatchmakingCog(commands.Cog):
 
         if match_row["status"] != "in_progress":
             return False, "This match is not currently in progress."
+
+        set_scores, parse_error = parse_final_score(final_score_text)
+        if parse_error:
+            return False, parse_error
+
+        elo_calc, elo_error = calculate_match_team_deltas(set_scores, winner_side)
+        if elo_error:
+            return False, elo_error
 
         wmvp_row = fetchone("""
             SELECT * FROM mm_match_players
@@ -2002,11 +2252,16 @@ class MatchmakingCog(commands.Cog):
 
         players = get_match_players(match_number)
         season_number = match_row["season_number"]
+        elo_changes: list[dict] = []
+
+        base_winner_delta = elo_calc["winner_delta"]
+        base_loser_delta = elo_calc["loser_delta"]
+        normalized_final_score = elo_calc["final_score_display"]
 
         for row in players:
             if row["team_side"] == winner_side:
-                delta = WIN_ELO + (WIN_MVP_BONUS if row["user_id"] == wmvp_id else 0)
-                apply_match_result_to_player(
+                delta = base_winner_delta + (WMVP_BONUS if row["user_id"] == wmvp_id else 0)
+                result = apply_match_result_to_player(
                     user_id=row["user_id"],
                     season_number=season_number,
                     delta=delta,
@@ -2015,8 +2270,8 @@ class MatchmakingCog(commands.Cog):
                     is_loss_mvp=False
                 )
             else:
-                delta = LOSS_MVP_ELO if row["user_id"] == lmvp_id else LOSS_ELO
-                apply_match_result_to_player(
+                delta = base_loser_delta + (LMVP_REDUCTION if row["user_id"] == lmvp_id else 0)
+                result = apply_match_result_to_player(
                     user_id=row["user_id"],
                     season_number=season_number,
                     delta=delta,
@@ -2025,6 +2280,9 @@ class MatchmakingCog(commands.Cog):
                     is_loss_mvp=(row["user_id"] == lmvp_id)
                 )
 
+            if result:
+                elo_changes.append(result)
+
         execute("""
             UPDATE mm_matches
             SET status = 'finished',
@@ -2032,6 +2290,7 @@ class MatchmakingCog(commands.Cog):
                 loser_side = ?,
                 wmvp_id = ?,
                 lmvp_id = ?,
+                final_score_text = ?,
                 finished_at = ?
             WHERE match_number = ?
         """, (
@@ -2039,6 +2298,7 @@ class MatchmakingCog(commands.Cog):
             loser_side,
             wmvp_id,
             lmvp_id,
+            normalized_final_score,
             now_str(),
             match_number
         ))
@@ -2050,6 +2310,12 @@ class MatchmakingCog(commands.Cog):
             results_channel = guild.get_channel(MM_RESULTS_CHANNEL_ID)
             if isinstance(results_channel, discord.TextChannel):
                 await results_channel.send(embed=build_result_embed(guild, updated))
+
+            elo_update_channel = guild.get_channel(ELO_UPDATE_CHANNEL_ID)
+            if isinstance(elo_update_channel, discord.TextChannel):
+                await elo_update_channel.send(
+                    embed=build_elo_update_embed(guild, updated, elo_changes)
+                )
 
             if updated["queue_channel_id"] and updated["queue_message_id"]:
                 queue_channel = guild.get_channel(updated["queue_channel_id"])
