@@ -26,11 +26,15 @@ ELO_UPDATE_CHANNEL_ID = getattr(config, "ELO_UPDATE_CHANNEL_ID", 148832069780885
 MAX_SETTERS = 4
 MAX_SPIKERS = 8
 
-BASE_WIN_ELO = 18
-BASE_LOSS_ELO = -16
+BASE_WIN_ELO = 22
+BASE_LOSS_ELO = -14
 WMVP_BONUS = 6
 LMVP_REDUCTION = 6
 REPLACE_LEAVE_PENALTY = -10
+
+SPECIAL_MATCH_CHANCE = 0.20
+SPECIAL_MATCH_MULTIPLIER = 3
+SPECIAL_MATCH_NAME = "🏆 GOLDEN MATCH"
 
 # =========================
 # BASIC HELPERS
@@ -291,10 +295,16 @@ def init_matchmaking_tables():
     """)
 
     ensure_column_exists("mm_matches", "final_score_text", "TEXT")
+    ensure_column_exists("mm_matches", "is_special", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column_exists("mm_matches", "special_multiplier", "INTEGER NOT NULL DEFAULT 1")
 
 
 def format_elo_delta(delta: int) -> str:
     return f"+{delta}" if delta > 0 else str(delta)
+
+
+def is_special_match(match_row) -> bool:
+    return bool(match_row["is_special"]) if match_row and "is_special" in match_row.keys() else False
 
 
 def parse_final_score(final_score_text: str) -> tuple[list[tuple[int, int]] | None, str | None]:
@@ -557,13 +567,35 @@ def build_match_started_embed(guild: discord.Guild | None, match_row):
     team_a = get_team_players(match_row["match_number"], "A")
     team_b = get_team_players(match_row["match_number"], "B")
 
+    special = is_special_match(match_row)
+    multiplier = match_row["special_multiplier"] if "special_multiplier" in match_row.keys() else 1
+
+    description = f"**Private Server Link**\n{match_row['private_server_link']}"
+
+    if special:
+        description = (
+            f"## {SPECIAL_MATCH_NAME}\n"
+            f"⚡ **This is a Special Match!**\n"
+            f"The winning team will earn **{multiplier}x Elo**.\n\n"
+            f"**Private Server Link**\n{match_row['private_server_link']}"
+        )
+
     embed = discord.Embed(
         title=f"Match In Progress • #{match_row['match_number']}",
-        description=f"**Private Server Link**\n{match_row['private_server_link']}",
-        color=discord.Color.dark_green()
+        description=description,
+        color=discord.Color.gold() if special else discord.Color.dark_green()
     )
+
     embed.add_field(name="Team A", value=build_team_lines(guild, team_a), inline=False)
     embed.add_field(name="Team B", value=build_team_lines(guild, team_b), inline=False)
+
+    if special:
+        embed.add_field(
+            name="Bonus Rule",
+            value=f"Winner receives **{multiplier}x Elo** for this match.",
+            inline=False
+        )
+
     embed.set_footer(text="SAVL Match Making")
     return embed
 
@@ -576,6 +608,16 @@ def build_result_embed(guild: discord.Guild | None, match_row):
         title=f"Match Result • #{match_row['match_number']}",
         color=discord.Color.purple()
     )
+
+    special = is_special_match(match_row)
+    multiplier = match_row["special_multiplier"] if "special_multiplier" in match_row.keys() else 1
+
+    if special:
+        embed.color = discord.Color.gold()
+        embed.description = (
+            f"{SPECIAL_MATCH_NAME}\n"
+            f"Winner team earned **{multiplier}x Elo** in this match."
+        )
 
     final_score_text = match_row["final_score_text"] if "final_score_text" in match_row.keys() else None
     if final_score_text:
@@ -630,8 +672,25 @@ def build_elo_update_embed(guild: discord.Guild | None, match_row, elo_changes: 
         color=discord.Color.orange()
     )
 
+    special = is_special_match(match_row)
+    multiplier = match_row["special_multiplier"] if "special_multiplier" in match_row.keys() else 1
+
+    if special:
+        embed.color = discord.Color.gold()
+        embed.description = (
+            f"{SPECIAL_MATCH_NAME}\n"
+            f"Winning team received **{multiplier}x Elo**."
+        )
+
     if match_row["final_score_text"]:
         embed.add_field(name="Final Score", value=match_row["final_score_text"], inline=False)
+
+    if special:
+        embed.add_field(
+            name="Special Bonus",
+            value=f"Winner team had its base Elo multiplied by **x{multiplier}**.",
+            inline=False
+        )
 
     embed.add_field(
         name=f"{team_side_label(match_row['winner_side'])} • Gained",
@@ -1333,6 +1392,8 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
         if not isinstance(category, discord.CategoryChannel):
             await interaction.response.send_message("Match Making category not found.", ephemeral=True)
             return
+        
+        match_organizer_role = guild.get_role(MATCH_ORGANIZER_ROLE_ID)
 
         team_a = get_team_players(self.match_number, "A")
         team_b = get_team_players(self.match_number, "B")
@@ -1342,6 +1403,13 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
             interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
         }
+
+        if match_organizer_role:
+            overwrites_text[match_organizer_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
 
         for row in team_a + team_b:
             member = guild.get_member(row["user_id"])
@@ -1357,15 +1425,49 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
 
         overwrites_team_a = {
             guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True, move_members=True),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                manage_channels=True,
+                move_members=True
+            ),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                move_members=True
+            ),
         }
+
+        if match_organizer_role:
+            overwrites_team_a[match_organizer_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                move_members=True,
+                speak=True
+            )
 
         overwrites_team_b = {
             guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True, move_members=True),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                manage_channels=True,
+                move_members=True
+            ),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                move_members=True
+            ),
         }
+
+        if match_organizer_role:
+            overwrites_team_b[match_organizer_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                move_members=True,
+                speak=True
+            )
 
         for row in team_a:
             member = guild.get_member(row["user_id"])
@@ -1391,6 +1493,9 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
             reason=f"Match Making #{self.match_number} Team B voice"
         )
 
+        is_special = random.random() < SPECIAL_MATCH_CHANCE
+        special_multiplier = SPECIAL_MATCH_MULTIPLIER if is_special else 1
+
         execute("""
             UPDATE mm_matches
             SET status = 'in_progress',
@@ -1398,6 +1503,8 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
                 text_channel_id = ?,
                 team_a_voice_id = ?,
                 team_b_voice_id = ?,
+                is_special = ?,
+                special_multiplier = ?,
                 started_at = ?
             WHERE match_number = ?
         """, (
@@ -1405,6 +1512,8 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
             text_channel.id,
             team_a_voice.id,
             team_b_voice.id,
+            1 if is_special else 0,
+            special_multiplier,
             now_str(),
             self.match_number
         ))
@@ -2085,7 +2194,9 @@ class MatchmakingCog(commands.Cog):
         execute("""
             UPDATE mm_matches
             SET status = 'cancelled',
-                finished_at = ?
+                finished_at = ?,
+                is_special = COALESCE(is_special, 0),
+                special_multiplier = COALESCE(special_multiplier, 1)
             WHERE match_number = ?
         """, (now_str(), number))
 
@@ -2257,6 +2368,12 @@ class MatchmakingCog(commands.Cog):
         base_winner_delta = elo_calc["winner_delta"]
         base_loser_delta = elo_calc["loser_delta"]
         normalized_final_score = elo_calc["final_score_display"]
+
+        special_multiplier = match_row["special_multiplier"] if "special_multiplier" in match_row.keys() else 1
+        special = is_special_match(match_row)
+
+        if special:
+            base_winner_delta *= special_multiplier
 
         for row in players:
             if row["team_side"] == winner_side:
