@@ -125,6 +125,21 @@ async def get_site_team_by_bot_team(team_row: Any) -> dict[str, Any] | None:
     if not is_enabled() or not team_row:
         return None
 
+    try:
+        site_team_id = team_row["site_team_id"]
+    except Exception:
+        site_team_id = None
+
+    if site_team_id:
+        rows = await _request(
+            "GET",
+            "teams",
+            f"?select=*&id=eq.{quote(str(site_team_id))}&limit=1",
+            prefer=None,
+        )
+        if isinstance(rows, list) and rows:
+            return rows[0]
+
     role_id = str(team_row["team_role_id"])
     rows = await _request(
         "GET",
@@ -147,6 +162,107 @@ async def get_site_team_by_bot_team(team_row: Any) -> dict[str, Any] | None:
         return rows[0]
 
     return None
+
+
+async def fetch_site_team_by_role(role_id: int | str) -> dict[str, Any] | None:
+    if not is_enabled() or not role_id:
+        return None
+
+    rows = await _request(
+        "GET",
+        "teams",
+        f"?select=*&discord_role_id=eq.{quote(str(role_id))}&limit=1",
+        prefer=None,
+    )
+    if isinstance(rows, list) and rows:
+        return rows[0]
+    return None
+
+
+async def fetch_site_team_by_id(site_team_id: int | str | None) -> dict[str, Any] | None:
+    if not is_enabled() or not site_team_id:
+        return None
+
+    rows = await _request(
+        "GET",
+        "teams",
+        f"?select=*&id=eq.{quote(str(site_team_id))}&limit=1",
+        prefer=None,
+    )
+    if isinstance(rows, list) and rows:
+        return rows[0]
+    return None
+
+
+async def fetch_site_team_by_captain(discord_id: int | str) -> dict[str, Any] | None:
+    if not is_enabled() or not discord_id:
+        return None
+
+    rows = await _request(
+        "GET",
+        "teams",
+        f"?select=*&captain_discord_id=eq.{quote(str(discord_id))}&limit=1",
+        prefer=None,
+    )
+    if isinstance(rows, list) and rows:
+        return rows[0]
+    return None
+
+
+async def fetch_site_team_for_manager(discord_id: int | str) -> dict[str, Any] | None:
+    """Return the site team managed by this Discord user as captain or vice captain."""
+    if not is_enabled() or not discord_id:
+        return None
+
+    captain_team = await fetch_site_team_by_captain(discord_id)
+    if captain_team:
+        return captain_team
+
+    player_rows = await _request(
+        "GET",
+        "team_players",
+        f"?select=team_id&discord_id=eq.{quote(str(discord_id))}&role=eq.Vice%20Captain&limit=1",
+        prefer=None,
+    )
+    if isinstance(player_rows, list) and player_rows:
+        return await fetch_site_team_by_id(player_rows[0].get("team_id"))
+
+    return None
+
+
+async def fetch_site_team_for_player(discord_id: int | str) -> dict[str, Any] | None:
+    if not is_enabled() or not discord_id:
+        return None
+
+    captain_team = await fetch_site_team_by_captain(discord_id)
+    if captain_team:
+        return captain_team
+
+    player_rows = await _request(
+        "GET",
+        "team_players",
+        f"?select=team_id&discord_id=eq.{quote(str(discord_id))}&limit=1",
+        prefer=None,
+    )
+    if isinstance(player_rows, list) and player_rows:
+        return await fetch_site_team_by_id(player_rows[0].get("team_id"))
+
+    return None
+
+
+async def fetch_site_roster(site_team_id: int | str | None) -> list[dict[str, Any]]:
+    if not is_enabled() or not site_team_id:
+        return []
+
+    rows = await _request(
+        "GET",
+        "team_players",
+        f"?select=*&team_id=eq.{quote(str(site_team_id))}",
+        prefer=None,
+    )
+    if isinstance(rows, list):
+        return rows
+    return []
 
 
 async def create_team_transaction(

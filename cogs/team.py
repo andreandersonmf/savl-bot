@@ -15,6 +15,10 @@ from services.supabase_bridge import (
     mirror_team_create,
     mirror_team_delete,
     clear_team_transaction,
+    fetch_site_team_by_role,
+    fetch_site_team_for_manager,
+    fetch_site_team_for_player,
+    fetch_site_roster,
 )
 
 
@@ -58,7 +62,109 @@ def in_self_transactions_channel(interaction: discord.Interaction) -> bool:
     return interaction.channel_id == config.SELF_TRANSACTIONS_CHANNEL_ID
 
 
-def get_management_team(member: discord.Member):
+def _safe_int_id(value) -> int | None:
+    text = str(value or "").strip()
+    return int(text) if text.isdigit() else None
+
+
+def _site_team_name(site_team: dict) -> str:
+    return str(site_team.get("country") or site_team.get("name") or "Team")
+
+
+async def sync_site_team_to_local(site_team: dict | None):
+    """Copy the Supabase team/roster into the bot SQLite shadow DB.
+
+    The site/Supabase is the source of truth for changes made from the website.
+    This keeps /team info, /team add, /team remove and /team leave aligned after
+    an Admin changes captain, roster or roles in the site panel.
+    """
+    if not site_team:
+        return None
+
+    role_id = _safe_int_id(site_team.get("discord_role_id"))
+    captain_id = _safe_int_id(site_team.get("captain_discord_id"))
+    site_team_id = str(site_team.get("id") or "").strip()
+    if not role_id or not captain_id or not site_team_id:
+        return None
+
+    team_name = _site_team_name(site_team)
+
+    local = fetchone(
+        "SELECT * FROM teams WHERE site_team_id = ? OR team_role_id = ?",
+        (site_team_id, role_id),
+    )
+
+    if local:
+        conflict = fetchone(
+            "SELECT * FROM teams WHERE captain_discord_id = ? AND id != ?",
+            (captain_id, local["id"]),
+        )
+        if conflict:
+            execute("DELETE FROM roster WHERE team_id = ?", (conflict["id"],))
+            execute("DELETE FROM transfers WHERE team_id = ?", (conflict["id"],))
+            execute("DELETE FROM teams WHERE id = ?", (conflict["id"],))
+
+        execute(
+            """
+            UPDATE teams
+            SET team_name = ?, team_role_id = ?, captain_discord_id = ?, site_team_id = ?
+            WHERE id = ?
+            """,
+            (team_name, role_id, captain_id, site_team_id, local["id"]),
+        )
+        local_id = local["id"]
+    else:
+        conflict = fetchone(
+            "SELECT * FROM teams WHERE captain_discord_id = ? OR team_role_id = ?",
+            (captain_id, role_id),
+        )
+        if conflict:
+            execute(
+                """
+                UPDATE teams
+                SET team_name = ?, team_role_id = ?, captain_discord_id = ?, site_team_id = ?
+                WHERE id = ?
+                """,
+                (team_name, role_id, captain_id, site_team_id, conflict["id"]),
+            )
+            local_id = conflict["id"]
+        else:
+            local_id = execute(
+                """
+                INSERT INTO teams (team_name, team_role_id, captain_discord_id, site_team_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (team_name, role_id, captain_id, site_team_id),
+            )
+
+    # Rebuild the shadow roster from the site. Captains live on teams; team_players stores only roster/vice.
+    site_roster = await fetch_site_roster(site_team_id)
+    execute("DELETE FROM roster WHERE team_id = ?", (local_id,))
+    for player in site_roster:
+        discord_id = _safe_int_id(player.get("discord_id"))
+        if not discord_id or discord_id == captain_id:
+            continue
+        role_type = "vice_captain" if player.get("role") == "Vice Captain" else "player"
+        try:
+            execute(
+                """
+                INSERT OR IGNORE INTO roster (team_id, discord_id, role_type, added_by)
+                VALUES (?, ?, ?, ?)
+                """,
+                (local_id, discord_id, role_type, captain_id),
+            )
+        except Exception:
+            pass
+
+    return fetchone("SELECT * FROM teams WHERE id = ?", (local_id,))
+
+
+async def get_management_team(member: discord.Member):
+    site_team = await fetch_site_team_for_manager(member.id)
+    synced = await sync_site_team_to_local(site_team)
+    if synced:
+        return synced
+
     team = fetchone(
         "SELECT * FROM teams WHERE captain_discord_id = ?",
         (member.id,)
@@ -74,13 +180,37 @@ def get_management_team(member: discord.Member):
     return team
 
 
-def get_team_by_role(role_id: int):
+async def get_team_by_role(role_id: int):
+    site_team = await fetch_site_team_by_role(role_id)
+    synced = await sync_site_team_to_local(site_team)
+    if synced:
+        return synced
     return fetchone("SELECT * FROM teams WHERE team_role_id = ?", (role_id,))
 
 
 def get_team_by_name(team_name: str):
     return fetchone("SELECT * FROM teams WHERE team_name = ?", (team_name,))
 
+
+async def get_player_current_team(discord_id: int):
+    site_team = await fetch_site_team_for_player(discord_id)
+    synced = await sync_site_team_to_local(site_team)
+    if synced:
+        return synced
+
+    team = fetchone("""
+        SELECT t.* FROM teams t
+        JOIN roster r ON r.team_id = t.id
+        WHERE r.discord_id = ?
+    """, (discord_id,))
+    if team:
+        return team
+
+    team = fetchone(
+        "SELECT * FROM teams WHERE captain_discord_id = ?",
+        (discord_id,)
+    )
+    return team
 
 def remove_team_related_roles(
     guild: discord.Guild,
@@ -170,22 +300,6 @@ def build_staff_remove_embed(
     )
     embed.set_footer(text="SAVL Team System")
     return embed
-
-
-def get_player_current_team(discord_id: int):
-    team = fetchone("""
-        SELECT t.* FROM teams t
-        JOIN roster r ON r.team_id = t.id
-        WHERE r.discord_id = ?
-    """, (discord_id,))
-    if team:
-        return team
-
-    team = fetchone(
-        "SELECT * FROM teams WHERE captain_discord_id = ?",
-        (discord_id,)
-    )
-    return team
 
 
 def profile_only_view(profile_url: str):
@@ -407,7 +521,7 @@ class TransferRequestView(discord.ui.View):
             await interaction.followup.send("Não foi possível localizar requester/player no servidor.", ephemeral=True)
             return
 
-        existing_team = get_player_current_team(player.id)
+        existing_team = await get_player_current_team(player.id)
         if existing_team:
             await interaction.followup.send("Esse jogador já está registrado em um time.", ephemeral=True)
             return
@@ -516,12 +630,12 @@ class TeamCog(commands.Cog):
             await interaction.response.send_message("Apenas administração pode usar esse comando.", ephemeral=True)
             return
 
-        existing_team = fetchone("SELECT * FROM teams WHERE team_role_id = ?", (role_team.id,))
+        existing_team = await get_team_by_role(role_team.id)
         if existing_team:
             await interaction.response.send_message("Esse cargo de time já está registrado.", ephemeral=True)
             return
 
-        existing_captain = fetchone("SELECT * FROM teams WHERE captain_discord_id = ?", (captain.id,))
+        existing_captain = await get_player_current_team(captain.id)
         if existing_captain:
             await interaction.response.send_message("Esse capitão já está registrado em um time.", ephemeral=True)
             return
@@ -563,7 +677,7 @@ class TeamCog(commands.Cog):
             )
             return
 
-        team_row = get_team_by_role(team.id)
+        team_row = await get_team_by_role(team.id)
         if not team_row:
             await interaction.response.send_message(
                 "Esse time não está registrado no banco.",
@@ -648,7 +762,7 @@ class TeamCog(commands.Cog):
 
     @team.command(name="info", description="Mostra as informações completas de um time")
     async def team_info(self, interaction: discord.Interaction, team: discord.Role):
-        team_row = get_team_by_role(team.id)
+        team_row = await get_team_by_role(team.id)
         if not team_row:
             await interaction.response.send_message("Esse time não está registrado no banco.", ephemeral=True)
             return
@@ -715,7 +829,7 @@ class TeamCog(commands.Cog):
             await interaction.response.send_message("Apenas captains e vice captains podem usar esse comando.", ephemeral=True)
             return
 
-        team = get_management_team(interaction.user)
+        team = await get_management_team(interaction.user)
         if not team:
             await interaction.response.send_message("Você não está registrado como captain/vice captain de nenhum time.", ephemeral=True)
             return
@@ -724,7 +838,7 @@ class TeamCog(commands.Cog):
             await interaction.response.send_message("Você não pode adicionar bots.", ephemeral=True)
             return
 
-        existing_team = get_player_current_team(player.id)
+        existing_team = await get_player_current_team(player.id)
         if existing_team:
             await interaction.response.send_message("Esse jogador já está registrado em um time.", ephemeral=True)
             return
@@ -806,7 +920,7 @@ class TeamCog(commands.Cog):
             await interaction.response.send_message("Apenas captains e vice captains podem usar esse comando.", ephemeral=True)
             return
 
-        team = get_management_team(interaction.user)
+        team = await get_management_team(interaction.user)
         if not team:
             await interaction.response.send_message("Você não está registrado como captain/vice captain de nenhum time.", ephemeral=True)
             return
@@ -1041,7 +1155,7 @@ class TeamCog(commands.Cog):
             )
             return
 
-        team_row = get_team_by_role(team.id)
+        team_row = await get_team_by_role(team.id)
         if not team_row:
             await interaction.response.send_message(
                 "Esse time não está registrado no banco.",
@@ -1060,7 +1174,7 @@ class TeamCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        existing_team = get_player_current_team(user.id)
+        existing_team = await get_player_current_team(user.id)
         if existing_team:
             await interaction.followup.send(
                 "Esse usuário já está registrado em um time.",
@@ -1128,7 +1242,7 @@ class TeamCog(commands.Cog):
             )
             return
 
-        team_row = get_team_by_role(team.id)
+        team_row = await get_team_by_role(team.id)
         if not team_row:
             await interaction.response.send_message(
                 "Esse time não está registrado no banco.",

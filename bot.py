@@ -28,6 +28,11 @@ class SAVLBot(commands.Bot):
     async def setup_hook(self):
         init_db()
 
+        if config.SUPABASE_SYNC_ENABLED:
+            print("[OK] Supabase sync enabled: bot <-> site roster bridge is active")
+        else:
+            print("[WARN] Supabase sync disabled. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Discloud .env for site/bot connection.")
+
         for ext in EXTENSIONS:
             try:
                 await self.load_extension(ext)
