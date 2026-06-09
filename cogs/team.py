@@ -7,6 +7,12 @@ from discord.ext import commands
 import config
 from database import execute, fetchone, fetchall
 from utils.roblox import get_profile_data_from_member
+from services.supabase_bridge import (
+    create_team_transaction,
+    update_team_transaction,
+    mirror_roster_add,
+    mirror_roster_remove,
+)
 
 
 ROLE_CHOICES = [
@@ -320,6 +326,13 @@ class DenyReasonModal(discord.ui.Modal, title="Deny Transfer"):
             WHERE id = ?
         """, (str(self.reason), interaction.user.id, self.transfer_id))
 
+        await update_team_transaction(
+            external_id=self.transfer_id,
+            status="denied",
+            handled_by=interaction.user,
+            reason=str(self.reason),
+        )
+
         profile_data = await get_profile_data_from_member(player)
 
         embed = build_denied_transfer_embed(
@@ -426,6 +439,20 @@ class TransferRequestView(discord.ui.View):
             await player.add_roles(*roles_to_add, reason=f"Transfer accepted by {interaction.user}")
 
         profile_data = await get_profile_data_from_member(player)
+
+        await update_team_transaction(
+            external_id=self.transfer_id,
+            status="accepted",
+            handled_by=interaction.user,
+        )
+        await mirror_roster_add(
+            team_row=team,
+            player=player,
+            role_type=transfer["requested_role_type"],
+            added_by=interaction.user,
+            roblox_username=profile_data.get("username"),
+            roblox_user_id=profile_data.get("user_id"),
+        )
 
         embed = build_success_transfer_embed(
             requester=requester,
@@ -716,6 +743,22 @@ class TeamCog(commands.Cog):
             interaction.channel_id
         ))
 
+        supabase_transaction = await create_team_transaction(
+            external_id=transfer_id,
+            team_row=team,
+            requester=interaction.user,
+            player=player,
+            requested_role_type=role.value,
+            roblox_username=profile_data.get("username"),
+            roblox_user_id=profile_data.get("user_id"),
+            channel_id=interaction.channel_id,
+        )
+        if supabase_transaction and supabase_transaction.get("id"):
+            execute(
+                "UPDATE transfers SET supabase_transaction_id = ? WHERE id = ?",
+                (str(supabase_transaction["id"]), transfer_id),
+            )
+
         embed = build_pending_transfer_embed(
             requester=interaction.user,
             player=player,
@@ -732,6 +775,7 @@ class TeamCog(commands.Cog):
             "UPDATE transfers SET message_id = ? WHERE id = ?",
             (sent_message.id, transfer_id)
         )
+        await update_team_transaction(external_id=transfer_id, message_id=sent_message.id)
 
         await interaction.followup.send("Transfer request sent successfully.", ephemeral=True)
 
@@ -772,6 +816,7 @@ class TeamCog(commands.Cog):
             "DELETE FROM roster WHERE team_id = ? AND discord_id = ?",
             (team["id"], player.id)
         )
+        await mirror_roster_remove(team_row=team, player=player)
 
         guild = interaction.guild
         if guild is not None:
@@ -842,6 +887,7 @@ class TeamCog(commands.Cog):
             "DELETE FROM roster WHERE team_id = ? AND discord_id = ?",
             (roster_row["team_id"], interaction.user.id)
         )
+        await mirror_roster_remove(team_row=roster_row, player=interaction.user)
 
         guild = interaction.guild
         if guild is not None:
@@ -1135,6 +1181,16 @@ class TeamCog(commands.Cog):
             VALUES (?, ?, ?, ?)
         """, (team_row["id"], user.id, role.value, interaction.user.id))
 
+        profile_data = await get_profile_data_from_member(user)
+        await mirror_roster_add(
+            team_row=team_row,
+            player=user,
+            role_type=role.value,
+            added_by=interaction.user,
+            roblox_username=profile_data.get("username"),
+            roblox_user_id=profile_data.get("user_id"),
+        )
+
         team_role = guild.get_role(team_row["team_role_id"])
         vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)
         player_role = guild.get_role(config.PLAYER_ROLE_ID) if config.PLAYER_ROLE_ID else None
@@ -1218,6 +1274,7 @@ class TeamCog(commands.Cog):
             DELETE FROM roster
             WHERE team_id = ? AND discord_id = ?
         """, (team_row["id"], user.id))
+        await mirror_roster_remove(team_row=team_row, player=user)
 
         team_role = guild.get_role(team_row["team_role_id"])
         vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)

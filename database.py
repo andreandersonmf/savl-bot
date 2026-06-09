@@ -10,6 +10,13 @@ def get_connection():
     return conn
 
 
+def ensure_column(cur, table: str, column: str, definition: str):
+    cur.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cur.fetchall()}
+    if column not in existing:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db():
     conn = get_connection()
     cur = conn.cursor()
@@ -87,6 +94,9 @@ def init_db():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
+
+    ensure_column(cur, "transfers", "supabase_transaction_id", "TEXT")
+    ensure_column(cur, "teams", "site_team_id", "TEXT")
 
     conn.commit()
     conn.close()

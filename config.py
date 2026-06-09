@@ -21,3 +21,8 @@ STAFF_APPROVER_ROLE_IDS = [
     for role_id in _staff_ids_raw.split(",")
     if role_id.strip().isdigit()
 ]
+# Optional Supabase bridge. Use the Service Role key only in the bot/Discloud, never in the website frontend.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_SYNC_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
