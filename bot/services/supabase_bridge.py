@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -318,90 +317,3 @@ async def mirror_roster_remove(*, team_row: Any, player: discord.Member | discor
         f"?team_id=eq.{site_team.get('id')}&discord_id=eq.{quote(str(player.id))}",
         prefer="return=minimal",
     )
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _team_code_from_name(team_name: str) -> str:
-    cleaned = "".join(char for char in str(team_name).upper() if char.isalnum())
-    return (cleaned[:8] or "TEAM")
-
-
-async def mirror_team_create(*, team_row: Any, captain: discord.Member | discord.User) -> dict[str, Any] | None:
-    """Create or update the matching site team when /team create links a Discord role."""
-    if not is_enabled() or not team_row:
-        return None
-
-    season_id = await get_active_season_id()
-    captain_profile = await upsert_profile_from_member(captain)
-    existing = await get_site_team_by_bot_team(team_row)
-
-    team_name = str(team_row["team_name"])
-    payload = {
-        "country": team_name,
-        "code": existing.get("code") if existing else _team_code_from_name(team_name),
-        "captain_name": (captain_profile or {}).get("roblox_username") or getattr(captain, "display_name", team_name),
-        "captain_discord": _discord_username(captain),
-        "captain_discord_id": str(captain.id),
-        "captain_roblox_id": str((captain_profile or {}).get("roblox_user_id") or captain.id),
-        "discord_role_id": str(team_row["team_role_id"]),
-        "approved": True,
-        "approved_at": _now_iso(),
-    }
-    if season_id:
-        payload["season_id"] = season_id
-
-    if existing:
-        rows = await _request(
-            "PATCH",
-            "teams",
-            f"?id=eq.{quote(str(existing['id']))}",
-            payload,
-            prefer="return=representation",
-        )
-    else:
-        rows = await _request("POST", "teams", "", payload, prefer="return=representation")
-
-    if isinstance(rows, list) and rows:
-        return rows[0]
-    return existing
-
-
-async def mirror_team_delete(*, team_row: Any) -> None:
-    """Remove the linked site team when /team delete is used in Discord."""
-    if not is_enabled() or not team_row:
-        return
-
-    site_team = await get_site_team_by_bot_team(team_row)
-    if not site_team:
-        return
-
-    site_team_id = site_team.get("id")
-    await _request("DELETE", "team_players", f"?team_id=eq.{quote(str(site_team_id))}", prefer="return=minimal")
-    await _request("DELETE", "team_transactions", f"?team_id=eq.{quote(str(site_team_id))}", prefer="return=minimal")
-    await _request("DELETE", "teams", f"?id=eq.{quote(str(site_team_id))}", prefer="return=minimal")
-
-
-async def clear_team_transaction(*, external_id: int | str | None = None, player_discord_id: int | str | None = None) -> None:
-    """Delete a pending site transfer when /team clear removes it in Discord."""
-    if not is_enabled():
-        return
-
-    if external_id is not None:
-        await _request(
-            "DELETE",
-            "team_transactions",
-            f"?external_source=eq.discord_bot&external_id=eq.{quote(str(external_id))}&status=eq.pending",
-            prefer="return=minimal",
-        )
-        return
-
-    if player_discord_id is not None:
-        await _request(
-            "DELETE",
-            "team_transactions",
-            f"?player_discord_id=eq.{quote(str(player_discord_id))}&status=eq.pending",
-            prefer="return=minimal",
-        )

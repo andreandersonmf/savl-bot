@@ -12,9 +12,6 @@ from services.supabase_bridge import (
     update_team_transaction,
     mirror_roster_add,
     mirror_roster_remove,
-    mirror_team_create,
-    mirror_team_delete,
-    clear_team_transaction,
 )
 
 
@@ -526,11 +523,10 @@ class TeamCog(commands.Cog):
             await interaction.response.send_message("Esse capitão já está registrado em um time.", ephemeral=True)
             return
 
-        team_id = execute("""
+        execute("""
             INSERT INTO teams (team_name, team_role_id, captain_discord_id)
             VALUES (?, ?, ?)
         """, (role_team.name, role_team.id, captain.id))
-        team_row = fetchone("SELECT * FROM teams WHERE id = ?", (team_id,))
 
         roles_to_add = [role_team]
         captain_role = interaction.guild.get_role(config.CAPTAIN_ROLE_ID)
@@ -538,13 +534,6 @@ class TeamCog(commands.Cog):
             roles_to_add.append(captain_role)
 
         await captain.add_roles(*roles_to_add, reason="Registered as team captain")
-
-        site_team = await mirror_team_create(team_row=team_row, captain=captain)
-        if site_team and site_team.get("id"):
-            execute(
-                "UPDATE teams SET site_team_id = ? WHERE id = ?",
-                (str(site_team["id"]), team_id),
-            )
 
         await interaction.response.send_message(
             f"Time **{role_team.name}** criado com sucesso.\nCapitão: {captain.mention}\nCargo do time: {role_team.mention}",
@@ -630,9 +619,6 @@ class TeamCog(commands.Cog):
                     )
                 except discord.Forbidden:
                     pass
-
-        # Espelha a exclusão no site/Supabase antes de limpar o banco local.
-        await mirror_team_delete(team_row=team_row)
 
         # Limpa banco
         execute("DELETE FROM roster WHERE team_id = ?", (team_row["id"],))
@@ -992,10 +978,6 @@ class TeamCog(commands.Cog):
             "DELETE FROM transfers WHERE id = ?",
             (transfer["id"],)
         )
-        await clear_team_transaction(
-            external_id=transfer["id"],
-            player_discord_id=player.id,
-        )
 
         if old_message and team is not None:
             cleared_embed = build_cleared_transfer_embed(
@@ -1018,9 +1000,135 @@ class TeamCog(commands.Cog):
             ephemeral=True
         )
 
-    # /team captainchange foi removido de propósito.
-    # A troca de capitão agora é feita pelo painel do site, usando /api/team-sync,
-    # para manter site, Supabase, cargos do Discord e /team info sincronizados.
+    @team.command(name="captainchange", description="Troca o capitão de um time")
+    async def team_captainchange(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member
+    ):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not is_admin(interaction.user):
+            await interaction.response.send_message(
+                "Apenas administração pode usar esse comando.",
+                ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Guild não encontrada.", ephemeral=True)
+            return
+
+        if user.bot:
+            await interaction.response.send_message("Você não pode definir um bot como capitão.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        current_team = get_player_current_team(user.id)
+        if not current_team:
+            await interaction.followup.send(
+                "Esse usuário não está registrado em nenhum time.",
+                ephemeral=True
+            )
+            return
+
+        team_row = current_team
+
+        if team_row["captain_discord_id"] == user.id:
+            await interaction.followup.send(
+                "Esse usuário já é o capitão desse time.",
+                ephemeral=True
+            )
+            return
+
+        # Bloqueia trocar para alguém de outro time
+        roster_row = fetchone("""
+            SELECT * FROM roster
+            WHERE team_id = ? AND discord_id = ?
+        """, (team_row["id"], user.id))
+
+        if not roster_row:
+            await interaction.followup.send(
+                "Esse usuário precisa estar no roster do time para virar capitão.",
+                ephemeral=True
+            )
+            return
+
+        old_captain = guild.get_member(team_row["captain_discord_id"])
+        captain_role = guild.get_role(config.CAPTAIN_ROLE_ID)
+        vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)
+        team_role = guild.get_role(team_row["team_role_id"])
+
+        # Remove user do roster, pois agora ele será captain
+        execute("""
+            DELETE FROM roster
+            WHERE team_id = ? AND discord_id = ?
+        """, (team_row["id"], user.id))
+
+        # Capitão antigo vira player normal no roster
+        if old_captain is not None:
+            execute("""
+                INSERT INTO roster (team_id, discord_id, role_type, added_by)
+                VALUES (?, ?, 'player', ?)
+            """, (team_row["id"], old_captain.id, interaction.user.id))
+
+        # Atualiza capitão do time
+        execute("""
+            UPDATE teams
+            SET captain_discord_id = ?
+            WHERE id = ?
+        """, (user.id, team_row["id"]))
+
+        # Cargos do novo capitão
+        roles_to_add_new = []
+        if team_role and team_role not in user.roles:
+            roles_to_add_new.append(team_role)
+        if captain_role and captain_role not in user.roles:
+            roles_to_add_new.append(captain_role)
+
+        roles_to_remove_new = []
+        if roster_row["role_type"] == "vice_captain" and vice_role and vice_role in user.roles:
+            roles_to_remove_new.append(vice_role)
+        if roster_row["role_type"] == "player" and config.PLAYER_ROLE_ID:
+            player_role = guild.get_role(config.PLAYER_ROLE_ID)
+            if player_role and player_role in user.roles:
+                roles_to_remove_new.append(player_role)
+
+        if roles_to_remove_new:
+            await user.remove_roles(*roles_to_remove_new, reason=f"Captain changed by {interaction.user}")
+        if roles_to_add_new:
+            await user.add_roles(*roles_to_add_new, reason=f"Captain changed by {interaction.user}")
+
+        # Capitão antigo perde captain e recebe player
+        if old_captain is not None:
+            roles_to_remove_old = []
+            if captain_role and captain_role in old_captain.roles:
+                roles_to_remove_old.append(captain_role)
+
+            if roles_to_remove_old:
+                await old_captain.remove_roles(*roles_to_remove_old, reason=f"Captain changed by {interaction.user}")
+
+            player_role = guild.get_role(config.PLAYER_ROLE_ID) if config.PLAYER_ROLE_ID else None
+            roles_to_add_old = []
+            if team_role and team_role not in old_captain.roles:
+                roles_to_add_old.append(team_role)
+            if player_role and player_role not in old_captain.roles:
+                roles_to_add_old.append(player_role)
+
+            if roles_to_add_old:
+                await old_captain.add_roles(*roles_to_add_old, reason=f"Captain changed by {interaction.user}")
+
+        embed = build_captain_changed_embed(
+            requester=interaction.user,
+            team_name=team_row["team_name"],
+            old_captain=old_captain,
+            new_captain=user
+        )
+        await interaction.followup.send(embed=embed, ephemeral=False)
+
 
     @team.command(name="staffadd", description="Adiciona manualmente um player a qualquer roster")
     @app_commands.choices(role=STAFF_ROLE_CHOICES)
@@ -1145,7 +1253,7 @@ class TeamCog(commands.Cog):
 
         if user.id == team_row["captain_discord_id"]:
             await interaction.followup.send(
-                "Troque o capitão pelo painel do site. Esse comando não remove o capitão.",
+                "Use /team captainchange para trocar o capitão. Esse comando não remove o capitão.",
                 ephemeral=True
             )
             return
