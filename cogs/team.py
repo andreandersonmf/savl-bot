@@ -19,6 +19,7 @@ from services.supabase_bridge import (
     fetch_site_team_for_manager,
     fetch_site_team_for_player,
     fetch_site_roster,
+    record_roster_transaction,
 )
 
 
@@ -940,11 +941,22 @@ class TeamCog(commands.Cog):
             await interaction.followup.send("Esse jogador não está no seu time.", ephemeral=True)
             return
 
+        profile_data = await get_profile_data_from_member(player)
+
         execute(
             "DELETE FROM roster WHERE team_id = ? AND discord_id = ?",
             (team["id"], player.id)
         )
         await mirror_roster_remove(team_row=team, player=player)
+        await record_roster_transaction(
+            team_row=team,
+            transaction_type="remove_player",
+            player=player,
+            actor=interaction.user,
+            role_type=roster_row["role_type"],
+            roblox_username=profile_data.get("username"),
+            roblox_user_id=profile_data.get("user_id"),
+        )
 
         guild = interaction.guild
         if guild is not None:
@@ -1011,11 +1023,22 @@ class TeamCog(commands.Cog):
             )
             return
 
+        profile_data = await get_profile_data_from_member(interaction.user)
+
         execute(
             "DELETE FROM roster WHERE team_id = ? AND discord_id = ?",
             (roster_row["team_id"], interaction.user.id)
         )
         await mirror_roster_remove(team_row=roster_row, player=interaction.user)
+        await record_roster_transaction(
+            team_row=roster_row,
+            transaction_type="leave_team",
+            player=interaction.user,
+            actor=interaction.user,
+            role_type=roster_row["role_type"],
+            roblox_username=profile_data.get("username"),
+            roblox_user_id=profile_data.get("user_id"),
+        )
 
         guild = interaction.guild
         if guild is not None:
@@ -1196,6 +1219,15 @@ class TeamCog(commands.Cog):
             roblox_username=profile_data.get("username"),
             roblox_user_id=profile_data.get("user_id"),
         )
+        await record_roster_transaction(
+            team_row=team_row,
+            transaction_type="add_player",
+            player=user,
+            actor=interaction.user,
+            role_type=role.value,
+            roblox_username=profile_data.get("username"),
+            roblox_user_id=profile_data.get("user_id"),
+        )
 
         team_role = guild.get_role(team_row["team_role_id"])
         vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)
@@ -1276,11 +1308,22 @@ class TeamCog(commands.Cog):
             )
             return
 
+        profile_data = await get_profile_data_from_member(user)
+
         execute("""
             DELETE FROM roster
             WHERE team_id = ? AND discord_id = ?
         """, (team_row["id"], user.id))
         await mirror_roster_remove(team_row=team_row, player=user)
+        await record_roster_transaction(
+            team_row=team_row,
+            transaction_type="remove_player",
+            player=user,
+            actor=interaction.user,
+            role_type=roster_row["role_type"],
+            roblox_username=profile_data.get("username"),
+            roblox_user_id=profile_data.get("user_id"),
+        )
 
         team_role = guild.get_role(team_row["team_role_id"])
         vice_role = guild.get_role(config.VICE_CAPTAIN_ROLE_ID)

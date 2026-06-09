@@ -76,10 +76,13 @@ async def get_active_season_id() -> str | None:
 
 
 def _discord_username(member: discord.Member | discord.User) -> str:
-    discriminator = getattr(member, "discriminator", "0")
+    # Discord's new username system often exposes discriminator "0".
+    # SAVL stores the clean username, never "name#0".
+    discriminator = str(getattr(member, "discriminator", "0") or "0")
+    name = str(getattr(member, "name", "") or "").replace("#0", "").lstrip("@")
     if discriminator and discriminator != "0":
-        return f"{member.name}#{discriminator}"
-    return member.name
+        return f"{name}#{discriminator}"
+    return name
 
 
 async def upsert_profile_from_member(
@@ -342,7 +345,7 @@ async def update_team_transaction(
     if handled_by:
         payload["handled_by_discord_id"] = str(handled_by.id)
         payload["handled_by_discord_username"] = _discord_username(handled_by)
-        payload["handled_at"] = "now()"
+        payload["handled_at"] = _now_iso()
         await upsert_profile_from_member(handled_by)
     if reason is not None:
         payload["reason"] = reason
@@ -351,10 +354,6 @@ async def update_team_transaction(
 
     if not payload:
         return
-
-    # PostgREST cannot accept now() as a function through JSON, so replace with ISO-less server-side field omitted.
-    if payload.get("handled_at") == "now()":
-        payload.pop("handled_at", None)
 
     await _request(
         "PATCH",
@@ -498,6 +497,82 @@ async def mirror_team_delete(*, team_row: Any) -> None:
     await _request("DELETE", "team_players", f"?team_id=eq.{quote(str(site_team_id))}", prefer="return=minimal")
     await _request("DELETE", "team_transactions", f"?team_id=eq.{quote(str(site_team_id))}", prefer="return=minimal")
     await _request("DELETE", "teams", f"?id=eq.{quote(str(site_team_id))}", prefer="return=minimal")
+
+
+async def record_roster_transaction(
+    *,
+    team_row: Any,
+    transaction_type: str,
+    player: discord.Member | discord.User,
+    actor: discord.Member | discord.User | None = None,
+    role_type: str | None = None,
+    roblox_username: str | None = None,
+    roblox_user_id: int | str | None = None,
+    status: str = "accepted",
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    """Create a site-visible transaction log for immediate Discord roster actions.
+
+    /team add already creates a pending transaction and then updates it on Accept/Deny.
+    This helper is for direct actions such as /team remove, /team leave,
+    /team staffadd and /team staffremove so Profile stays complete.
+    """
+    if not is_enabled():
+        return None
+
+    site_team = await get_site_team_by_bot_team(team_row)
+    season_id = (site_team or {}).get("season_id") or await get_active_season_id()
+    requested_role = None
+    if role_type:
+        requested_role = "Vice Captain" if role_type == "vice_captain" else "Player"
+
+    if actor:
+        await upsert_profile_from_member(actor)
+
+    player_profile = await upsert_profile_from_member(
+        player,
+        roblox_username=roblox_username,
+        roblox_user_id=roblox_user_id,
+    )
+
+    external_id = f"log_{transaction_type}_{getattr(player, 'id', 'unknown')}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    actor_id = str(actor.id) if actor else str(player.id)
+    actor_username = _discord_username(actor) if actor else _discord_username(player)
+
+    payload = {
+        "season_id": season_id,
+        "team_id": (site_team or {}).get("id"),
+        "team_name": str(team_row["team_name"]),
+        "team_discord_role_id": str(team_row["team_role_id"]),
+        "transaction_type": transaction_type,
+        "requested_role": requested_role,
+        "status": status,
+        "source": "discord",
+        "external_source": "discord_bot",
+        "external_id": external_id,
+        "requester_discord_id": actor_id,
+        "requester_discord_username": actor_username,
+        "handled_by_discord_id": actor_id,
+        "handled_by_discord_username": actor_username,
+        "handled_at": _now_iso(),
+        "player_profile_id": player_profile.get("id") if player_profile else None,
+        "player_discord_id": str(player.id),
+        "player_discord_username": _discord_username(player),
+        "roblox_username": roblox_username or (player_profile or {}).get("roblox_username"),
+        "roblox_user_id": str(roblox_user_id or (player_profile or {}).get("roblox_user_id") or "") or None,
+        "reason": reason,
+    }
+
+    rows = await _request(
+        "POST",
+        "team_transactions",
+        "",
+        payload,
+        prefer="return=representation",
+    )
+    if isinstance(rows, list) and rows:
+        return rows[0]
+    return None
 
 
 async def clear_team_transaction(*, external_id: int | str | None = None, player_discord_id: int | str | None = None) -> None:

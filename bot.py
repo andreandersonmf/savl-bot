@@ -7,8 +7,6 @@ from database import init_db
 
 EXTENSIONS = [
     "cogs.team",
-    "cogs.match",
-    "cogs.schedule",
     "cogs.scrim",
     "cogs.matchmaking",
 ]
