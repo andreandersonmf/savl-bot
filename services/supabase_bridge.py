@@ -283,8 +283,8 @@ async def create_team_transaction(
     if not is_enabled():
         return None
 
-    season_id = await get_active_season_id()
     site_team = await get_site_team_by_bot_team(team_row)
+    season_id = (site_team or {}).get("season_id") or await get_active_season_id()
     requested_role = "Vice Captain" if requested_role_type == "vice_captain" else "Player"
 
     await upsert_profile_from_member(requester)
@@ -316,13 +316,30 @@ async def create_team_transaction(
         "discord_message_id": str(message_id) if message_id else None,
     }
 
-    rows = await _request(
-        "POST",
+    existing = await _request(
+        "GET",
         "team_transactions",
-        "?on_conflict=external_source,external_id",
-        payload,
-        prefer="resolution=merge-duplicates,return=representation",
+        f"?select=id&external_source=eq.discord_bot&external_id=eq.{quote(str(external_id))}&limit=1",
+        prefer=None,
     )
+
+    if isinstance(existing, list) and existing:
+        rows = await _request(
+            "PATCH",
+            "team_transactions",
+            f"?id=eq.{quote(str(existing[0]['id']))}",
+            payload,
+            prefer="return=representation",
+        )
+    else:
+        rows = await _request(
+            "POST",
+            "team_transactions",
+            "",
+            payload,
+            prefer="return=representation",
+        )
+
     if isinstance(rows, list) and rows:
         return rows[0]
     return None
@@ -587,7 +604,6 @@ async def clear_team_transaction(*, external_id: int | str | None = None, player
             f"?external_source=eq.discord_bot&external_id=eq.{quote(str(external_id))}&status=eq.pending",
             prefer="return=minimal",
         )
-        return
 
     if player_discord_id is not None:
         await _request(
